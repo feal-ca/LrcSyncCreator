@@ -1,0 +1,10 @@
+# Optional extras — the app runs fine without these.
+#
+# faster-whisper: powers Tools -> Validate Sync (a local, offline spot-check
+# of a few lines' lyrics/timing against the audio). Not installed by default
+# since it pulls in a speech-recognition backend and downloads a model
+# (~150MB) on first use. Install with:
+#
+#   pip install -r requirements-optional.txt
+#
+faster-whisper

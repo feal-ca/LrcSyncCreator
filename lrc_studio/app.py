@@ -28,7 +28,7 @@ import vlc
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFileDialog, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QScrollArea, QSlider, QSplitter, QVBoxLayout, QWidget,
@@ -58,8 +58,18 @@ from utils import (
     parse_lrc_timestamp,
     write_embedded_lyrics,
 )
+import lyrics_qa
+from dialogs import SettingsDialog, SoulseekSearchDialog, SpotifyImportDialog, ValidateSyncDialog
+from soulseek import SlskdClient, SoulseekFile
 from widgets import TimelineWidget, Verse
-from workers import LyricsDownloaderThread, LyricsSearchThread
+from workers import (
+    LyricsDownloaderThread,
+    LyricsQAThread,
+    LyricsSearchThread,
+    SoulseekDownloadThread,
+    SoulseekSearchThread,
+    SpotifyImportThread,
+)
 
 
 class LrcSyncApp(QMainWindow):
@@ -98,6 +108,11 @@ class LrcSyncApp(QMainWindow):
         self._downloader: LyricsDownloaderThread | None = None
         # Manual "Web Search" thread reference (kept to avoid GC)
         self._search_thread: LyricsSearchThread | None = None
+        # Soulseek search/download thread references (kept to avoid GC)
+        self._soulseek_search_thread: SoulseekSearchThread | None = None
+        self._soulseek_download_thread: SoulseekDownloadThread | None = None
+        self._spotify_import_thread: SpotifyImportThread | None = None
+        self._qa_thread: LyricsQAThread | None = None
 
         # Unsaved-changes tracking — drives the save-before-switch/close prompt.
         self._dirty: bool = False
@@ -308,6 +323,13 @@ class LrcSyncApp(QMainWindow):
         edit_menu.addSeparator()
         self._add_action(edit_menu, "Clear All Lyrics", None, self._clear_lyrics)
 
+        tools_menu = menu.addMenu("&Tools")
+        self._add_action(tools_menu, "Find on Soulseek…", "Ctrl+F", self._find_on_soulseek)
+        self._add_action(tools_menu, "Import Spotify Playlist…", None, self._import_spotify_playlist)
+        self._add_action(tools_menu, "Validate Sync…", None, self._validate_sync)
+        tools_menu.addSeparator()
+        self._add_action(tools_menu, "Settings…", None, self._open_settings_dialog)
+
         help_menu = menu.addMenu("&Help")
         self._add_action(help_menu, "Keyboard Shortcuts…", None, self._show_shortcuts_dialog)
         self._add_action(help_menu, "About LRC Studio", None, self._show_about_dialog)
@@ -452,6 +474,8 @@ class LrcSyncApp(QMainWindow):
         )
         for label, handler in [
             ("Add Files",          self._add_files_dialog),
+            ("Find on Soulseek",   self._find_on_soulseek),
+            ("Import Spotify Playlist", self._import_spotify_playlist),
             ("Standardize Names",  self._batch_rename_files),
             ("Download Lyrics",    self._batch_download_lyrics),
             ("Clear Completed",    self._remove_completed_files),
@@ -1050,6 +1074,206 @@ class LrcSyncApp(QMainWindow):
             and os.path.basename(self.current_file_path) in success
         ):
             self._load_song(self.current_file_path)
+
+    def _fetch_lyrics_for(self, file_paths: list[str]) -> None:
+        """Kick off a lyrics-download pass for specific files (not the whole
+        library). Reuses the exact same downloader/handlers as the "Download
+        Lyrics" button — used to auto-fetch lyrics right after a Soulseek or
+        Spotify-triggered download lands.
+        """
+        if not file_paths:
+            return
+        self.progress_bar.setRange(0, len(file_paths))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self._downloader = LyricsDownloaderThread(file_paths)
+        self._downloader.progress.connect(self._on_download_progress)
+        self._downloader.finished_batch.connect(self._on_batch_finished)
+        self._downloader.start()
+
+    # ==================================================================
+    # Soulseek integration (via slskd — see lrc_studio/soulseek.py)
+    # ==================================================================
+
+    def _get_slskd_client(self) -> SlskdClient | None:
+        url = str(self.settings.value("slskd_url", "")).strip()
+        key = str(self.settings.value("slskd_api_key", "")).strip()
+        if not url or not key:
+            QMessageBox.information(
+                self,
+                "Soulseek Not Configured",
+                "Set up slskd first:\n\n"
+                "  ./scripts/setup_slskd.sh\n"
+                "  ./scripts/run_slskd.sh\n\n"
+                "Then fill in its URL and API key under Tools → Settings.",
+            )
+            return None
+        return SlskdClient(url, key)
+
+    def _open_settings_dialog(self) -> None:
+        SettingsDialog(self.settings, self).exec()
+
+    def _find_on_soulseek(self) -> None:
+        client = self._get_slskd_client()
+        if client is None:
+            return
+
+        default_query = os.path.splitext(self.song_filename)[0] if self.song_filename else ""
+        dialog = SoulseekSearchDialog(default_query, self)
+
+        def run_search() -> None:
+            dialog.set_searching(True)
+            self._soulseek_search_thread = SoulseekSearchThread(client, dialog.query_input.text().strip())
+            self._soulseek_search_thread.results_ready.connect(
+                lambda results: (dialog.set_searching(False), dialog.show_results(results))
+            )
+            self._soulseek_search_thread.search_failed.connect(
+                lambda msg: (dialog.set_searching(False), dialog.show_error(msg))
+            )
+            self._soulseek_search_thread.start()
+
+        dialog.search_button.clicked.connect(run_search)
+        if dialog.query_input.text().strip():
+            run_search()
+
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_file:
+            self._start_soulseek_download(client, dialog.selected_file, auto_fetch_lyrics=True)
+
+    def _start_soulseek_download(
+        self, client: SlskdClient, file: SoulseekFile, auto_fetch_lyrics: bool,
+    ) -> None:
+        downloads_dir = str(self.settings.value("slskd_downloads_dir", "")).strip()
+        library_dir = str(self.settings.value("library_dir", "")).strip() or os.getcwd()
+
+        self.status_bar.setText(f"Downloading {file.display_name} from Soulseek…")
+        self._soulseek_download_thread = SoulseekDownloadThread(
+            client, downloads_dir, library_dir, file,
+        )
+        self._soulseek_download_thread.progress.connect(self.status_bar.setText)
+        self._soulseek_download_thread.finished_ok.connect(
+            lambda path: self._on_soulseek_download_ok(path, auto_fetch_lyrics)
+        )
+        self._soulseek_download_thread.finished_fail.connect(self._on_soulseek_download_fail)
+        self._soulseek_download_thread.start()
+
+    def _on_soulseek_download_ok(self, local_path: str, auto_fetch_lyrics: bool) -> None:
+        self.status_bar.setText(f"Downloaded: {os.path.basename(local_path)}")
+        self._process_added_files([local_path])
+        if auto_fetch_lyrics:
+            self._fetch_lyrics_for([local_path])
+
+    def _on_soulseek_download_fail(self, message: str) -> None:
+        self.status_bar.setText("Soulseek download failed.")
+        QMessageBox.warning(self, "Download Failed", message)
+
+    # ==================================================================
+    # Spotify playlist import (paste-a-link, no developer credentials)
+    # ==================================================================
+
+    def _collect_library_paths(self) -> list[str]:
+        """Every audio file we should treat as "already have" for dedup.
+
+        Scans the configured library folder (the real source of truth for
+        "songs I already own") plus anything already in the current
+        session's file list, in case some of those live elsewhere on disk.
+        """
+        paths: set[str] = set()
+        library_dir = str(self.settings.value("library_dir", "")).strip()
+        if library_dir and os.path.isdir(library_dir):
+            for root, _dirs, files in os.walk(library_dir):
+                for fname in files:
+                    if fname.lower().endswith(AUDIO_EXTENSIONS):
+                        paths.add(os.path.join(root, fname))
+        for i in range(self.file_list.count()):
+            paths.add(self.file_list.item(i).data(Qt.ItemDataRole.UserRole))
+        return list(paths)
+
+    def _import_spotify_playlist(self) -> None:
+        client = self._get_slskd_client()
+        if client is None:
+            return
+
+        dialog = SpotifyImportDialog(self)
+
+        def start_import() -> None:
+            link = dialog.link_input.text().strip()
+            if not link:
+                return
+            dialog.set_busy(True)
+            dialog.log_list.clear()
+
+            downloads_dir = str(self.settings.value("slskd_downloads_dir", "")).strip()
+            library_dir = str(self.settings.value("library_dir", "")).strip() or os.getcwd()
+            library_paths = self._collect_library_paths()
+
+            self._spotify_import_thread = SpotifyImportThread(
+                client, downloads_dir, library_dir, link, library_paths,
+            )
+            self._spotify_import_thread.progress.connect(dialog.log)
+            self._spotify_import_thread.track_done.connect(
+                lambda label, ok, detail: dialog.log(f"{'✓' if ok else '✗'} {label} — {detail}")
+            )
+            self._spotify_import_thread.fetch_failed.connect(
+                lambda msg: (dialog.log(f"Failed: {msg}"), dialog.set_busy(False))
+            )
+            self._spotify_import_thread.finished_import.connect(
+                lambda paths, skipped_existing, skipped_missing:
+                    self._on_spotify_import_finished(dialog, paths, skipped_existing, skipped_missing)
+            )
+            self._spotify_import_thread.start()
+
+        dialog.import_button.clicked.connect(start_import)
+        dialog.exec()
+
+    def _on_spotify_import_finished(
+        self, dialog: SpotifyImportDialog, new_paths: list[str],
+        skipped_existing: int, skipped_no_result: int,
+    ) -> None:
+        dialog.set_busy(False)
+        dialog.log(
+            f"Done — {len(new_paths)} downloaded, {skipped_existing} already in "
+            f"your library, {skipped_no_result} not found on Soulseek."
+        )
+        if new_paths:
+            self._process_added_files(new_paths)
+            self._fetch_lyrics_for(new_paths)
+
+    # ==================================================================
+    # Optional sync validation (faster-whisper spot-check)
+    # ==================================================================
+
+    def _validate_sync(self) -> None:
+        if not lyrics_qa.is_available():
+            QMessageBox.information(
+                self,
+                "Optional Feature Not Installed",
+                "Validate Sync uses faster-whisper to locally spot-check a "
+                "few lines against the audio — it's optional and not "
+                "installed by default.\n\n"
+                "Install it with:\n    pip install faster-whisper\n\n"
+                "(First run downloads a small speech model, ~150MB; after "
+                "that it works fully offline and takes a few seconds per song.)",
+            )
+            return
+        if not self.current_file_path or not self._verses:
+            return
+
+        lines = [
+            (i, v.get_verse_text(), self._verse_timestamps[i])
+            for i, v in enumerate(self._verses)
+            if v.get_timestamp() != DEFAULT_TIMESTAMP and v.get_verse_text().strip()
+        ]
+        if not lines:
+            QMessageBox.information(self, "Validate Sync", "No synced lines to check yet.")
+            return
+
+        dialog = ValidateSyncDialog(self)
+        self._qa_thread = LyricsQAThread(self.current_file_path, lines)
+        self._qa_thread.progress.connect(dialog.set_status)
+        self._qa_thread.finished_qa.connect(dialog.show_results)
+        self._qa_thread.failed.connect(lambda msg: dialog.set_status(f"Failed: {msg}"))
+        self._qa_thread.start()
+        dialog.exec()
 
     # ==================================================================
     # Unsaved-changes tracking & window state
