@@ -6,37 +6,41 @@ LRC Sync Tool is a powerful application for synchronizing audio files with their
 
 ## Features
 
-1. **Audio Playback**: Load and play `.mp3` files with basic media controls, including a seek bar.
-2. **Lyric Synchronization**: Sync lyrics with audio by adding, adjusting, and editing timestamps.
-3. **Verse Management**: Clear, add, delete, or resync verses within the lyric display.
-4. **Keyboard Shortcuts**:
+1. **Audio Playback**: Load and play `.mp3`/`.flac`/`.wav`/`.ogg`/`.m4a`/`.opus` files via VLC, with a seek bar and PipeWire/PulseAudio output-device selection (Linux).
+2. **Lyric Synchronization**: Sync lyrics with audio by adding, adjusting, and editing timestamps — by keyboard, by dragging blocks on the timeline, or with a global ±ms offset for tracks that drift uniformly.
+3. **Verse Management**: Add, delete, sort, or undo verse edits; fast keyboard-driven line entry (press Enter to jump to the next line).
+4. **Keyboard Shortcuts** (see Help → Keyboard Shortcuts in-app for the full list):
     - **Space**: Toggle play/pause.
-    - **"N" Key**: Quickly sync the next verse.
-5. **Online Lyrics Fetching**: Search for and import lyrics online.
+    - **S**: Sync the current line to playback and advance.
+    - **Enter** (in a line): Move to the next line.
+    - **↑ / ↓**: Select previous/next line. **← / →**: Seek -5s/+5s.
+    - **Ctrl+S**: Save. **Ctrl+Z**: Undo last sync. **Ctrl+T**: Sort by time.
+5. **Online Lyrics Fetching**: Search for and import synced lyrics online, individually or in a batch across your whole file list.
 6. **File Operations**:
-    - Load LRC files with synchronized timestamps.
-    - Save custom-synced LRC files.
+    - Load and save `.lrc` sidecar files.
+    - Optionally embed the same synced lyrics into the audio file's own tags (ID3 USLT / Vorbis comment / MP4 atom).
+    - Prompts to save before you switch songs or close the app with unsaved changes.
 
 ---
 
 ## Installation
-Clone this repository, download it or get the `lrcSync.py` in some way.  
-For the required libraries:
+Clone this repository, then install the dependencies:
 ```bash
-pip install PyQt6 syncedlyrics
+pip install -r requirements.txt
 ```
-You will also need to have QT installed.
+You'll also need VLC and Qt installed at the system level (the `vlc` binary/libraries, and `pactl` on Linux for the audio-device selector).
+
 ---
 
 ## Usage
 
 ### Starting the App
-1. Run the app with `python lrcSync.py`.
-2. Click "Open MP3 File" to load an audio file.
+Run `./run-lrc.sh`, or directly: `python3 lrc_studio/main.py`.
 
 ### Syncing Lyrics
-1. Use "Get Lyrics" to fetch lyrics online or "Load LRC File" to import an existing file.
-2. Use "Resync All" for batch resynchronization, or click the ⏲ button next to each line for individual synchronization.
+1. Add audio files via "Add Files" or drag-and-drop.
+2. Use "Web Search" or "Download Lyrics" (batch) to fetch existing synced lyrics, or type your own.
+3. Play the track and press **S** to stamp each line as it starts, or drag verse blocks directly on the timeline to fine-tune.
 
 ---
 
@@ -55,9 +59,8 @@ The interface is quite intuitive:
 ---
 
 ## Roadmap
-- Add "click to select"
-- Visual Changes to the interface
-- Add real-time current lyric under the player
+- Soulseek integration for finding/downloading missing tracks (planned — likely via a `slskd` companion daemon)
+- Waveform rendering in the timeline
 
 ## License
 
