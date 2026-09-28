@@ -1,6 +1,6 @@
-PyQt6
-python-vlc
-mutagen
-syncedlyrics
-requests
-rapidfuzz
+PyQt6>=6.10,<7
+python-vlc>=3.0,<4
+mutagen>=1.47,<2
+syncedlyrics>=1.0,<2
+requests>=2.32,<3
+rapidfuzz>=3.14,<4

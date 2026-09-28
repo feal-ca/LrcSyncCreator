@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 M/
 
 # slskd is downloaded locally by scripts/setup_slskd.sh, and its config
