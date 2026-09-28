@@ -629,11 +629,11 @@ class LrcSyncApp(QMainWindow):
 
         layout.addWidget(self._make_group_label("Fetch"))
         fetch_row = QHBoxLayout()
-        web_search_btn = QPushButton("Web Search")
-        web_search_btn.setToolTip("Search online for synced lyrics for this song")
-        web_search_btn.clicked.connect(self._get_lyrics_online)
-        web_search_btn.setStyleSheet(self._neutral_button_style())
-        fetch_row.addWidget(web_search_btn)
+        get_lyrics_btn = QPushButton("Get Lyrics")
+        get_lyrics_btn.setToolTip("Search online for synced lyrics for this song")
+        get_lyrics_btn.clicked.connect(self._get_lyrics_online)
+        get_lyrics_btn.setStyleSheet(self._neutral_button_style())
+        fetch_row.addWidget(get_lyrics_btn)
         layout.addLayout(fetch_row)
 
         layout.addWidget(self._make_group_label("Edit"))
@@ -860,6 +860,22 @@ class LrcSyncApp(QMainWindow):
         QTimer.singleShot(50, self._update_timeline)
         self._mark_dirty()
 
+    def _replace_all_verses(self, lines: list[tuple[str, str]]) -> None:
+        """Wipe the current verse list and replace it with *lines*
+        ((timestamp_str, text) pairs) — no confirmation. The primitive
+        behind both Get Lyrics (an intentional replace) and Clear All
+        (which adds its own confirmation before calling this with [])."""
+        for v in self._verses:
+            self.lyrics_layout.removeWidget(v)
+            v.deleteLater()
+        self._verses.clear()
+        self._playback_highlight_verse = None
+        self.current_verse_index = 0
+        for ts_str, content in lines:
+            self._add_verse(ts_str, content)
+        self._update_timeline()
+        self._mark_dirty()
+
     def _clear_lyrics(self) -> None:
         # The one action in the app with no undo path at all — unlike a
         # sync (Ctrl-Z) or a song switch (caught by the dirty-check
@@ -875,14 +891,7 @@ class LrcSyncApp(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         ) != QMessageBox.StandardButton.Yes:
             return
-        for v in self._verses:
-            self.lyrics_layout.removeWidget(v)
-            v.deleteLater()
-        self._verses.clear()
-        self._playback_highlight_verse = None
-        self.current_verse_index = 0
-        self._update_timeline()
-        self._mark_dirty()
+        self._replace_all_verses([])
 
     def _select_verse(self, index: int) -> None:
         if not self._verses:
@@ -1059,7 +1068,7 @@ class LrcSyncApp(QMainWindow):
 
     def _on_search_result(self, result: str) -> None:
         if result:
-            self._clear_lyrics()
+            self._replace_all_verses([])
             self._parse_and_add_lyrics(result)
             self._mark_dirty()
             self.status_bar.setText("Lyrics found!")
@@ -1507,7 +1516,7 @@ class LrcSyncApp(QMainWindow):
             f"font-weight: bold; font-size: 14px; color: {color.name()};"
         )
 
-        self._clear_lyrics()
+        self._replace_all_verses([])
         if os.path.exists(lrc_path):
             try:
                 with open(lrc_path, encoding="utf-8") as fh:

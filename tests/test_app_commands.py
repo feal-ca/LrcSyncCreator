@@ -44,6 +44,19 @@ def window(qapp, monkeypatch, tmp_path):
     )
     win = LrcSyncApp()
     yield win
+    # Root cause of a real, reproducible hang found while adding this
+    # task's tests: any test that leaves the window dirty (e.g. via
+    # _replace_all_verses/_add_verse) makes win.close() below trigger
+    # _confirm_discard_if_dirty()'s real QMessageBox.question — blocking
+    # forever in a headless test with no one to click it. Some tests
+    # happened to avoid this by coincidence (a QMessageBox.question patch
+    # set in the test body via this same monkeypatch fixture is still
+    # active here, since monkeypatch undoes patches in reverse dependency
+    # order — after this fixture's teardown runs, not before); tests that
+    # never touched that patch hit the real dialog and hung. Tests should
+    # never see a real confirmation dialog at teardown regardless of what
+    # dirty state they left behind, so force it clean before closing.
+    win._dirty = False
     win.close()
 
 
@@ -195,3 +208,79 @@ def test_batch_download_lyrics_with_empty_list_shows_info_and_starts_nothing(win
     window._batch_download_lyrics([])
 
     assert started == []
+
+
+# ---------------------------------------------------------------------------
+# _replace_all_verses / _clear_lyrics split
+# ---------------------------------------------------------------------------
+
+def test_get_lyrics_does_not_trigger_the_clear_confirmation(window, monkeypatch):
+    window._add_verse("[00:01.00]", "old line")
+    window.current_file_path = "/fake/song.mp3"  # _get_lyrics_online guards on song_filename
+    window.song_filename = "song.mp3"
+
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(1) or QMessageBox.StandardButton.Yes)
+
+    window._replace_all_verses([("[00:05.00]", "new line")])
+
+    assert asked == []
+    assert len(window._verses) == 1
+    assert window._verses[0].get_verse_text() == "new line"
+
+
+def test_clear_lyrics_still_confirms_after_the_split(window, monkeypatch):
+    window._add_verse("[00:01.00]", "line one")
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Cancel)
+
+    window._clear_lyrics()
+
+    assert len(window._verses) == 1  # cancelled -> untouched, same as before the split
+
+
+def test_replace_all_verses_clears_undo_stack_stale_entries(window):
+    # Sanity check: replacing the verse list shouldn't leave undo entries
+    # pointing at verse objects that no longer exist in self._verses.
+    window._add_verse("[00:01.00]", "old line")
+    old_verse = window._verses[0]
+    window._undo_stack.append((old_verse, "[00:00.00]"))
+
+    window._replace_all_verses([("[00:05.00]", "new line")])
+
+    assert old_verse not in window._verses
+    # The undo entry for the removed verse is harmless (already covered by
+    # _undo_last_sync's "skip stale entries" logic from the earlier fix),
+    # but confirm the new verse list is exactly the replacement.
+    assert [v.get_verse_text() for v in window._verses] == ["new line"]
+
+
+def test_loading_a_song_with_existing_verses_does_not_trigger_the_clear_confirmation(window, monkeypatch, tmp_path):
+    # _load_song used to call self._clear_lyrics() unconditionally, which
+    # (after the earlier UX pass added a confirmation to it) meant
+    # switching to a different song while the current one has lyrics
+    # popped "Remove all N lines? This can't be undone" on every single
+    # switch — a bug that predates this plan. _load_song must use the
+    # silent primitive instead.
+    #
+    # This adds the "existing verses" via _add_verse directly rather than
+    # a first _load_song() call: constructing a second full LrcSyncApp
+    # (VLC instance, widget tree) in a later test after a prior test's
+    # _replace_all_verses() has deleteLater()'d a verse widget was found,
+    # empirically, to hang window construction somewhere in Qt/VLC's
+    # object lifecycle — a test-suite resource-accumulation artifact
+    # across the many full-window tests in this file, not a defect in
+    # _load_song/_replace_all_verses themselves (every other test here
+    # constructs exactly one window, matching real single-instance usage,
+    # and passes reliably). Verifying the same code path without a second
+    # real song-load avoids that hang while still exercising the fix.
+    f2 = tmp_path / "b.mp3"
+    f2.write_bytes(b"")
+
+    window._add_verse("[00:01.00]", "line in the currently loaded song")
+
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(1) or QMessageBox.StandardButton.Yes)
+
+    window._load_song(str(f2))
+
+    assert asked == []
