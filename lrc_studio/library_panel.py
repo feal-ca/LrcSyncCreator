@@ -14,8 +14,8 @@ import mutagen
 from PyQt6.QtCore import QSettings, Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QFileDialog, QLabel, QListWidget, QListWidgetItem, QPushButton,
-    QVBoxLayout, QWidget,
+    QFileDialog, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
+    QPushButton, QToolButton, QVBoxLayout, QWidget,
 )
 
 from constants import (
@@ -28,6 +28,8 @@ from utils import analyze_lrc_status, clean_filename
 class LibraryPanel(QWidget):
     song_selected = pyqtSignal(str)
     file_renamed = pyqtSignal(str, str)
+    find_music_requested = pyqtSignal()
+    fetch_missing_lyrics_requested = pyqtSignal(list)
 
     def __init__(self, settings: QSettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -56,38 +58,35 @@ class LibraryPanel(QWidget):
             "QPushButton:hover { background-color: #45475a; }"
         )
 
-        layout.addWidget(self._make_group_label("Add music"))
-        for label, handler in [
-            ("Add Files", self.open_add_files_dialog),
-            ("Find on Soulseek", lambda: None),      # Task 2 rewires this
-            ("Import from Spotify", lambda: None),   # Task 2 rewires this
-        ]:
-            btn = QPushButton(label)
-            btn.clicked.connect(handler)
-            btn.setStyleSheet(btn_style)
-            layout.addWidget(btn)
+        action_row = QHBoxLayout()
 
-        layout.addWidget(self._make_group_label("Manage"))
-        for label, handler in [
-            ("Standardize Names", self._batch_rename_files),
-            ("Download Lyrics", lambda: None),        # Task 2 rewires this
-            ("Clear Completed", self._remove_completed_files),
-        ]:
-            btn = QPushButton(label)
-            btn.clicked.connect(handler)
-            btn.setStyleSheet(btn_style)
-            layout.addWidget(btn)
+        self.add_music_button = QToolButton()
+        self.add_music_button.setText("+ Add Music")
+        self.add_music_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        add_menu = QMenu(self.add_music_button)
+        add_menu.addAction("Add Files", self.open_add_files_dialog)
+        add_menu.addAction("Find Music", self.find_music_requested.emit)
+        self.add_music_button.setMenu(add_menu)
+        self.add_music_button.setStyleSheet(btn_style)
+        action_row.addWidget(self.add_music_button, stretch=1)
+
+        self.overflow_button = QToolButton()
+        self.overflow_button.setText("⋮")
+        self.overflow_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        overflow_menu = QMenu(self.overflow_button)
+        overflow_menu.addAction("Standardize Names", self._batch_rename_files)
+        overflow_menu.addAction("Clear Completed", self._remove_completed_files)
+        overflow_menu.addAction(
+            "Fetch Lyrics for All Missing",
+            lambda: self.fetch_missing_lyrics_requested.emit(self.paths_with_status(COLOR_MISSING)),
+        )
+        self.overflow_button.setMenu(overflow_menu)
+        self.overflow_button.setStyleSheet(btn_style)
+        action_row.addWidget(self.overflow_button)
+
+        layout.addLayout(action_row)
 
         self._refresh_placeholder()
-
-    @staticmethod
-    def _make_group_label(text: str) -> QLabel:
-        label = QLabel(text.upper())
-        label.setStyleSheet(
-            f"color: {COLOR_MUTED.name()}; font-size: 10px; font-weight: bold;"
-            " letter-spacing: 1px; margin-top: 6px;"
-        )
-        return label
 
     def _on_item_double_clicked(self, item: QListWidgetItem) -> None:
         path = item.data(Qt.ItemDataRole.UserRole)
