@@ -66,6 +66,19 @@ def extract_spotify_ref(link_or_uri: str) -> tuple[str, str]:
     )
 
 
+def is_spotify_link(text: str) -> bool:
+    """True if *text* is a Spotify track/album/playlist link, URI, or bare
+    ID — the same shapes extract_spotify_ref() accepts. Used to route the
+    unified Find Music input: a recognized link means "look up this
+    track list," anything else means "search Soulseek directly."
+    """
+    try:
+        extract_spotify_ref(text)
+        return True
+    except SpotifyLinkError:
+        return False
+
+
 def fetch_spotify_tracks(
     link_or_uri: str, timeout_s: float = 15.0,
 ) -> tuple[list[SpotifyTrack], bool]:
