@@ -26,13 +26,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
-import mutagen
 import vlc
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout,
+    QInputDialog, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton,
     QScrollArea, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -45,7 +44,6 @@ from constants import (
     COLOR_MISSING,
     COLOR_MUTED,
     COLOR_SYNCED,
-    COLOR_TIMELINE_BG,
     COLOR_UNSYNCED,
     DEFAULT_TIMESTAMP,
     MAX_UNDO,
@@ -54,7 +52,6 @@ from constants import (
 )
 from utils import (
     analyze_lrc_status,
-    clean_filename,
     format_ms,
     ms_to_lrc_timestamp,
     parse_lrc_file,
@@ -64,6 +61,7 @@ from utils import (
 import lyrics_qa
 from dialogs import SettingsDialog, SoulseekSearchDialog, ValidateSyncDialog
 from download_view import DownloadView
+from library_panel import LibraryPanel
 from soulseek import SlskdClient, SoulseekFile
 from widgets import TimelineWidget, Verse
 from workers import (
@@ -180,8 +178,8 @@ class LrcSyncApp(QMainWindow):
         if state == vlc.State.Ended:
             if not self._ended_handled:
                 self._ended_handled = True
-                row = self.file_list.currentRow()
-                if row < self.file_list.count() - 1:
+                row = self.library_panel.current_row()
+                if row < self.library_panel.row_count() - 1:
                     self._load_file_from_index(row + 1)
                     QTimer.singleShot(300, self.player.play)
                 else:
@@ -322,7 +320,10 @@ class LrcSyncApp(QMainWindow):
 
         # ── Splitter: file list | lyrics editor ───────────────────────
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.splitter.addWidget(self._build_file_panel())
+        self.library_panel = LibraryPanel(self.settings)
+        self.library_panel.song_selected.connect(self._on_library_song_selected)
+        self.library_panel.file_renamed.connect(self._on_file_renamed)
+        self.splitter.addWidget(self.library_panel)
         self.splitter.addWidget(self._build_lyrics_panel())
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 3)
@@ -356,10 +357,7 @@ class LrcSyncApp(QMainWindow):
         if not self._confirm_discard_if_dirty():
             return
         self._load_song(path)
-        for item in self._real_file_items():
-            if item.data(Qt.ItemDataRole.UserRole) == path:
-                self.file_list.setCurrentItem(item)
-                break
+        self.library_panel.select_path(path)
 
     def _go_to_download_tab(self) -> None:
         self.tabs.setCurrentWidget(self.download_view)
@@ -387,7 +385,9 @@ class LrcSyncApp(QMainWindow):
             _Command("Seek -5s", "Left", lambda: self._seek_delta(-5_000), None),
             _Command("Seek +5s", "Right", lambda: self._seek_delta(5_000), None),
 
-            _Command("Add Files…", "Ctrl+O", self._add_files_dialog, "file"),
+            # self.library_panel doesn't exist yet at _build_commands() time
+            # (it's constructed later in _init_ui) — lazy lookup via lambda.
+            _Command("Add Files…", "Ctrl+O", lambda: self.library_panel.open_add_files_dialog(), "file"),
             _Command("Save LRC", "Ctrl+S", self._save_lrc_file, "file"),
             _Command("Exit", "Ctrl+Q", self.close, "file", separator_before=True),
 
@@ -530,60 +530,6 @@ class LrcSyncApp(QMainWindow):
         row.addWidget(self.file_label)
         return row
 
-    def _build_file_panel(self) -> QWidget:
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        header = QLabel("Audio Files")
-        header.setStyleSheet(
-            f"font-weight: bold; color: {COLOR_FG.name()}; margin-bottom: 5px;"
-        )
-        layout.addWidget(header)
-
-        self.file_list = QListWidget()
-        self.file_list.setStyleSheet(
-            f"background-color: {COLOR_TIMELINE_BG.name()};"
-            " border: 1px solid #45475a; font-size: 13px; border-radius: 4px;"
-        )
-        self.file_list.itemDoubleClicked.connect(self._load_selected_file)
-        layout.addWidget(self.file_list)
-
-        # Two groups, separated so "get more music" and "tidy up what's here"
-        # read as distinct actions rather than one undifferentiated stack.
-        layout.addWidget(self._make_group_label("Add music"))
-        for label, handler, tooltip in [
-            ("Add Files", self._add_files_dialog,
-             "Browse for audio files to add to the list"),
-            ("Find on Soulseek", self._find_on_soulseek,
-             "Search Soulseek for a track and download it into your library"),
-            ("Import from Spotify", self._go_to_download_tab,
-             "Switch to the Download tab to import a Spotify track, album, or playlist"),
-        ]:
-            btn = QPushButton(label)
-            btn.setToolTip(tooltip)
-            btn.clicked.connect(handler)
-            btn.setStyleSheet(self._neutral_button_style())
-            layout.addWidget(btn)
-
-        layout.addWidget(self._make_group_label("Manage"))
-        for label, handler, tooltip in [
-            ("Standardize Names", self._batch_rename_files,
-             "Rename files to \"Artist - Title\" based on their tags"),
-            ("Download Lyrics", self._batch_download_lyrics,
-             "Fetch synced lyrics for every file that's missing them"),
-            ("Clear Completed", self._remove_completed_files,
-             "Remove fully-synced files from this list (their files aren't touched)"),
-        ]:
-            btn = QPushButton(label)
-            btn.setToolTip(tooltip)
-            btn.clicked.connect(handler)
-            btn.setStyleSheet(self._neutral_button_style())
-            layout.addWidget(btn)
-
-        self._refresh_file_list_placeholder()
-        return panel
-
     @staticmethod
     def _neutral_button_style() -> str:
         """The default look for a panel action button — used by every
@@ -626,26 +572,6 @@ class LrcSyncApp(QMainWindow):
             " letter-spacing: 1px; margin-top: 6px;"
         )
         return label
-
-    def _refresh_file_list_placeholder(self) -> None:
-        """Keep a hint item in the file list whenever it holds no real files."""
-        for i in range(self.file_list.count() - 1, -1, -1):
-            if not self.file_list.item(i).data(Qt.ItemDataRole.UserRole):
-                self.file_list.takeItem(i)
-        if self.file_list.count() == 0:
-            placeholder = QListWidgetItem(
-                "Drag audio files here, or click \"Add Files\" below"
-            )
-            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
-            placeholder.setForeground(COLOR_MUTED)
-            self.file_list.addItem(placeholder)
-
-    def _real_file_items(self) -> list[QListWidgetItem]:
-        """file_list items backed by an actual path (excludes the placeholder)."""
-        return [
-            self.file_list.item(i) for i in range(self.file_list.count())
-            if self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
-        ]
 
     def _build_lyrics_panel(self) -> QWidget:
         panel = QWidget()
@@ -1081,9 +1007,7 @@ class LrcSyncApp(QMainWindow):
         self._dirty = False
         self._update_title()
         self.status_bar.setText(status)
-        cur_item = self.file_list.currentItem()
-        if cur_item:
-            self._update_file_status_color(cur_item, self.current_file_path)
+        self.library_panel.refresh_status(self.current_file_path)
         self.file_label.setStyleSheet(
             f"font-weight: bold; font-size: 14px; color: {COLOR_SYNCED.name()};"
         )
@@ -1140,108 +1064,17 @@ class LrcSyncApp(QMainWindow):
     # File list management
     # ==================================================================
 
-    def _update_file_status_color(
-        self, item: QListWidgetItem, file_path: str
-    ) -> None:
-        lrc_path = os.path.splitext(file_path)[0] + ".lrc"
-        color    = analyze_lrc_status(lrc_path)
-        item.setForeground(color)
-        # QColor isn't hashable in PyQt6, so key the lookup by name() instead.
-        tip = {
-            COLOR_SYNCED.name():   "Synced",
-            COLOR_UNSYNCED.name(): "Unsynced (timestamps may be [00:00])",
-            COLOR_MISSING.name():  "No .lrc file",
-        }.get(color.name(), "Unknown")
-        item.setToolTip(tip)
-
     def _process_added_files(self, file_paths: list[str]) -> None:
-        # Don't strip the placeholder before adding: _refresh_file_list_placeholder()
-        # re-inserts a fresh one the instant the list is empty, which it always
-        # is right here on a first add — leaving that placeholder sitting at
-        # index 0 once real items get appended after it. _real_file_items()
-        # already excludes the placeholder (no UserRole data) without needing
-        # it physically removed first, so building `existing` from it is safe.
-        existing: set[str] = {item.data(Qt.ItemDataRole.UserRole) for item in self._real_file_items()}
-        for path in file_paths:
-            if (
-                os.path.isfile(path)
-                and path.lower().endswith(AUDIO_EXTENSIONS)
-                and path not in existing
-            ):
-                item = QListWidgetItem(os.path.basename(path))
-                item.setData(Qt.ItemDataRole.UserRole, path)
-                self._update_file_status_color(item, path)
-                self.file_list.addItem(item)
-                existing.add(path)
+        self.library_panel.add_files(file_paths)
 
-        self._refresh_file_list_placeholder()
-
-        # Checked via _real_file_items(), not file_list.count(): if nothing new
-        # was actually added (e.g. all duplicates), the placeholder above gets
-        # re-created and would otherwise be mistaken for a loadable row 0.
-        if not self.song_is_loaded and self._real_file_items():
+        # Checked via real_file_paths(), not row_count(): if nothing new
+        # was actually added (e.g. all duplicates), row_count() could still
+        # reflect a placeholder row and be mistaken for a loadable row 0.
+        if not self.song_is_loaded and self.library_panel.real_file_paths():
             self._load_file_from_index(0)
 
-    def _add_files_dialog(self) -> None:
-        last_dir = self.settings.value("last_dir", "")
-        files, _ = QFileDialog.getOpenFileNames(
-            self,
-            "Add Audio",
-            last_dir,
-            "Audio (*.mp3 *.flac *.wav *.ogg *.m4a *.opus)",
-        )
-        if files:
-            self.settings.setValue("last_dir", os.path.dirname(files[0]))
-            self._process_added_files(files)
-
-    def _batch_rename_files(self) -> None:
-        items = self._real_file_items()
-        if not items:
-            return
-        renamed = 0
-        for item in items:
-            old_path = item.data(Qt.ItemDataRole.UserRole)
-            ext      = os.path.splitext(old_path)[1]
-            try:
-                audio = mutagen.File(old_path, easy=True)
-                if not audio or "artist" not in audio or "title" not in audio:
-                    continue
-                artist   = clean_filename(audio["artist"][0])
-                title    = clean_filename(audio["title"][0])
-                new_name = f"{artist} - {title}{ext}"
-                new_path = os.path.join(os.path.dirname(old_path), new_name)
-                if old_path == new_path:
-                    continue
-                os.rename(old_path, new_path)
-                old_lrc = os.path.splitext(old_path)[0] + ".lrc"
-                new_lrc = os.path.splitext(new_path)[0] + ".lrc"
-                if os.path.exists(old_lrc):
-                    os.rename(old_lrc, new_lrc)
-                item.setText(new_name)
-                item.setData(Qt.ItemDataRole.UserRole, new_path)
-                # Keep current_file_path in sync if the loaded file was renamed.
-                if old_path == self.current_file_path:
-                    self.current_file_path = new_path
-                    self.song_filename     = new_name
-                    self.file_label.setText(new_name)
-                renamed += 1
-            except OSError as exc:
-                print(f"[warn] rename failed for {old_path}: {exc}")
-        self.status_bar.setText(f"Renamed {renamed} file(s).")
-
-    def _remove_completed_files(self) -> None:
-        for i in range(self.file_list.count() - 1, -1, -1):
-            item = self.file_list.item(i)
-            if item.foreground().color() == COLOR_SYNCED:
-                self.file_list.takeItem(i)
-        self._refresh_file_list_placeholder()
-
     def _batch_download_lyrics(self) -> None:
-        files: list[str] = []
-        for i in range(self.file_list.count()):
-            item = self.file_list.item(i)
-            if item.foreground().color() == COLOR_MISSING:
-                files.append(item.data(Qt.ItemDataRole.UserRole))
+        files = self.library_panel.paths_with_status(COLOR_MISSING)
 
         if not files:
             QMessageBox.information(self, "Info", "No missing lyrics to download.")
@@ -1271,10 +1104,8 @@ class LrcSyncApp(QMainWindow):
             parts.append(f"Failed: {len(failed)}.")
         self.status_bar.setText("  ".join(parts))
 
-        for item in self._real_file_items():
-            self._update_file_status_color(
-                item, item.data(Qt.ItemDataRole.UserRole)
-            )
+        for path in self.library_panel.real_file_paths():
+            self.library_panel.refresh_status(path)
         # Reload lyrics pane if the current song was among the downloads.
         if (
             self.current_file_path
@@ -1497,8 +1328,7 @@ class LrcSyncApp(QMainWindow):
                 for fname in files:
                     if fname.lower().endswith(AUDIO_EXTENSIONS):
                         paths.add(os.path.join(root, fname))
-        for item in self._real_file_items():
-            paths.add(item.data(Qt.ItemDataRole.UserRole))
+        paths.update(self.library_panel.real_file_paths())
         return list(paths)
 
     # ==================================================================
@@ -1611,16 +1441,22 @@ class LrcSyncApp(QMainWindow):
     # Song loading
     # ==================================================================
 
-    def _load_selected_file(self, item: QListWidgetItem) -> None:
+    def _on_library_song_selected(self, path: str) -> None:
         if not self._confirm_discard_if_dirty():
             return
-        self._load_song(item.data(Qt.ItemDataRole.UserRole))
+        self._load_song(path)
+
+    def _on_file_renamed(self, old_path: str, new_path: str) -> None:
+        if self.current_file_path == old_path:
+            self.current_file_path = new_path
+            self.song_filename = os.path.basename(new_path)
+            self.file_label.setText(self.song_filename)
+        self.status_bar.setText(f"Renamed to {os.path.basename(new_path)}.")
 
     def _load_file_from_index(self, index: int) -> None:
-        if 0 <= index < self.file_list.count():
-            item = self.file_list.item(index)
-            self.file_list.setCurrentItem(item)
-            self._load_song(item.data(Qt.ItemDataRole.UserRole))
+        if 0 <= index < self.library_panel.row_count():
+            self.library_panel.select_row(index)
+            self._load_song(self.library_panel.real_file_paths()[index])
 
     def _load_song(self, path: str) -> None:
         if not os.path.exists(path):
