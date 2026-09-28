@@ -320,9 +320,7 @@ class LrcSyncApp(QMainWindow):
         self.library_panel.song_selected.connect(self._on_library_song_selected)
         self.library_panel.file_renamed.connect(self._on_file_renamed)
         self.library_panel.find_music_requested.connect(self._find_music)
-        self.library_panel.fetch_missing_lyrics_requested.connect(
-            lambda paths: self._batch_download_lyrics()
-        )
+        self.library_panel.fetch_missing_lyrics_requested.connect(self._batch_download_lyrics)
         self.splitter.addWidget(self.library_panel)
 
         self.workspace = QStackedWidget()
@@ -1100,9 +1098,7 @@ class LrcSyncApp(QMainWindow):
         if not self.song_is_loaded and self.library_panel.real_file_paths():
             self._load_file_from_index(0)
 
-    def _batch_download_lyrics(self) -> None:
-        files = self.library_panel.paths_with_status(COLOR_MISSING)
-
+    def _batch_download_lyrics(self, files: list[str]) -> None:
         if not files:
             QMessageBox.information(self, "Info", "No missing lyrics to download.")
             return

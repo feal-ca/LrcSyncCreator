@@ -155,3 +155,43 @@ def test_command_table_has_one_find_music_entry_not_two(window):
     assert "Find Music…" in labels
     assert "Find on Soulseek…" not in labels
     assert "Import from Spotify" not in labels
+
+
+# ---------------------------------------------------------------------------
+# _batch_download_lyrics signature
+# ---------------------------------------------------------------------------
+
+def test_batch_download_lyrics_accepts_paths_directly(window, monkeypatch):
+    started = []
+    monkeypatch.setattr(window, "_downloader", None)
+
+    class FakeThread:
+        # isRunning() is required: window._downloader ends up holding this
+        # instance, and win.close() (fixture teardown) -> closeEvent ->
+        # stop_thread(self._downloader) calls .isRunning() unconditionally.
+        # Missing it raises AttributeError inside a Qt close-event callback,
+        # which PyQt turns into a fatal C++ abort rather than a normal
+        # Python exception — the same issue test_workspace.py's
+        # _FakeFetchThread had (see that file's docstring).
+        def __init__(self, files):
+            started.append(files)
+        progress = type("Signal", (), {"connect": lambda self, fn: None})()
+        finished_batch = type("Signal", (), {"connect": lambda self, fn: None})()
+        def start(self): pass
+        def isRunning(self): return False
+
+    monkeypatch.setattr(app_module, "LyricsDownloaderThread", FakeThread)
+
+    window._batch_download_lyrics(["/fake/a.mp3", "/fake/b.mp3"])
+
+    assert started == [["/fake/a.mp3", "/fake/b.mp3"]]
+
+
+def test_batch_download_lyrics_with_empty_list_shows_info_and_starts_nothing(window, monkeypatch):
+    started = []
+    monkeypatch.setattr(app_module, "LyricsDownloaderThread", lambda files: started.append(files))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+
+    window._batch_download_lyrics([])
+
+    assert started == []
