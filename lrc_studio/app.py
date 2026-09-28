@@ -22,6 +22,8 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from functools import partial
 
 import mutagen
@@ -44,7 +46,6 @@ from constants import (
     COLOR_MUTED,
     COLOR_SYNCED,
     COLOR_TIMELINE_BG,
-    COLOR_TIMELINE_BLOCK,
     COLOR_UNSYNCED,
     DEFAULT_TIMESTAMP,
     MAX_UNDO,
@@ -73,6 +74,25 @@ from workers import (
     SoulseekSearchThread,
     stop_thread,
 )
+
+
+@dataclass(frozen=True)
+class _Command:
+    """One entry in the app's single command table.
+
+    Every keyboard-triggerable action is declared exactly once here and
+    drives three things that used to be hand-maintained separately (and
+    had drifted out of sync with each other): the menu bar, the raw
+    QShortcut registrations for actions with no natural menu home, and
+    the Help -> Keyboard Shortcuts dialog.
+    """
+
+    label: str                        # menu text, e.g. "Add Files…"
+    shortcut: str | None              # e.g. "Ctrl+S", or None
+    handler: Callable[[], None]
+    menu: str | None                  # "file" | "edit" | "tools" | "help" | None
+    help_text: str | None = None      # Help-dialog phrasing; defaults to *label*
+    separator_before: bool = False    # start a new group within its menu
 
 
 class LrcSyncApp(QMainWindow):
@@ -260,6 +280,7 @@ class LrcSyncApp(QMainWindow):
         self.resize(1200, 850)
         self.setAcceptDrops(True)
 
+        self._commands = self._build_commands()
         self._build_menu_bar()
 
         self.tabs = QTabWidget()
@@ -343,57 +364,82 @@ class LrcSyncApp(QMainWindow):
     def _go_to_download_tab(self) -> None:
         self.tabs.setCurrentWidget(self.download_view)
 
+    def _build_commands(self) -> list[_Command]:
+        """The single source of truth for every keyboard-triggerable
+        action — see ``_Command`` for what building from this buys.
+
+        Playback/navigation commands (menu=None) get no menu entry on
+        purpose: they're real-time transport controls a person reaches
+        for by muscle memory while a song is playing, not discrete
+        one-shot commands someone would browse for in a dropdown — the
+        same reason a media player doesn't put "seek forward" in a menu.
+        They're listed first since they're what's used most while
+        actually syncing, and they still show up in the Help dialog.
+        """
+        return [
+            _Command("Play / Pause", "Space", self._toggle_play_pause_smart, None),
+            _Command(
+                "Sync current line, advance", "S", self._sync_next_verse, None,
+                help_text="Sync current line to playback, advance",
+            ),
+            _Command("Select previous line", "Up", lambda: self._select_verse(self.current_verse_index - 1), None),
+            _Command("Select next line", "Down", lambda: self._select_verse(self.current_verse_index + 1), None),
+            _Command("Seek -5s", "Left", lambda: self._seek_delta(-5_000), None),
+            _Command("Seek +5s", "Right", lambda: self._seek_delta(5_000), None),
+
+            _Command("Add Files…", "Ctrl+O", self._add_files_dialog, "file"),
+            _Command("Save LRC", "Ctrl+S", self._save_lrc_file, "file"),
+            _Command("Exit", "Ctrl+Q", self.close, "file", separator_before=True),
+
+            _Command("Undo Sync", "Ctrl+Z", self._undo_last_sync, "edit"),
+            _Command("Sort Lines by Time", "Ctrl+T", self._sort_verses_by_time, "edit"),
+            _Command("Shift All Timestamps…", "Ctrl+Shift+O", self._shift_all_timestamps, "edit"),
+            _Command("Clear All Lyrics", None, self._clear_lyrics, "edit", separator_before=True),
+
+            _Command("Find on Soulseek…", "Ctrl+F", self._find_on_soulseek, "tools"),
+            # No "…": unlike its neighbors, this doesn't open a dialog —
+            # it just switches to the already-one-click-away Download tab.
+            _Command("Import from Spotify", None, self._go_to_download_tab, "tools"),
+            _Command("Validate Sync…", None, self._validate_sync, "tools"),
+            _Command("Settings…", None, self._open_settings_dialog, "tools", separator_before=True),
+
+            _Command("Keyboard Shortcuts…", None, self._show_shortcuts_dialog, "help"),
+            _Command("About LRC Studio", None, self._show_about_dialog, "help"),
+        ]
+
     def _build_menu_bar(self) -> None:
-        menu = self.menuBar()
-
-        file_menu = menu.addMenu("&File")
-        self._add_action(file_menu, "Add Files…", "Ctrl+O", self._add_files_dialog)
-        self._add_action(file_menu, "Save LRC", "Ctrl+S", self._save_lrc_file)
-        file_menu.addSeparator()
-        self._add_action(file_menu, "Exit", "Ctrl+Q", self.close)
-
-        edit_menu = menu.addMenu("&Edit")
-        self._add_action(edit_menu, "Undo Sync", "Ctrl+Z", self._undo_last_sync)
-        self._add_action(edit_menu, "Sort Lines by Time", "Ctrl+T", self._sort_verses_by_time)
-        self._add_action(edit_menu, "Shift All Timestamps…", "Ctrl+Shift+O", self._shift_all_timestamps)
-        edit_menu.addSeparator()
-        self._add_action(edit_menu, "Clear All Lyrics", None, self._clear_lyrics)
-
-        tools_menu = menu.addMenu("&Tools")
-        self._add_action(tools_menu, "Find on Soulseek…", "Ctrl+F", self._find_on_soulseek)
-        self._add_action(tools_menu, "Import from Spotify…", None, self._go_to_download_tab)
-        self._add_action(tools_menu, "Validate Sync…", None, self._validate_sync)
-        tools_menu.addSeparator()
-        self._add_action(tools_menu, "Settings…", None, self._open_settings_dialog)
-
-        help_menu = menu.addMenu("&Help")
-        self._add_action(help_menu, "Keyboard Shortcuts…", None, self._show_shortcuts_dialog)
-        self._add_action(help_menu, "About LRC Studio", None, self._show_about_dialog)
-
-    @staticmethod
-    def _add_action(menu, label: str, shortcut: str | None, handler) -> QAction:
-        action = QAction(label, menu)
-        if shortcut:
-            action.setShortcut(QKeySequence(shortcut))
-        action.triggered.connect(handler)
-        menu.addAction(action)
-        return action
+        menu_bar = self.menuBar()
+        menus = {
+            "file":  menu_bar.addMenu("&File"),
+            "edit":  menu_bar.addMenu("&Edit"),
+            "tools": menu_bar.addMenu("&Tools"),
+            "help":  menu_bar.addMenu("&Help"),
+        }
+        for cmd in self._commands:
+            if cmd.menu is None:
+                continue
+            target = menus[cmd.menu]
+            if cmd.separator_before:
+                target.addSeparator()
+            action = QAction(cmd.label, target)
+            if cmd.shortcut:
+                action.setShortcut(QKeySequence(cmd.shortcut))
+            action.triggered.connect(cmd.handler)
+            target.addAction(action)
 
     def _show_shortcuts_dialog(self) -> None:
+        rows = "".join(
+            f"<tr><td><b>{cmd.shortcut}</b></td><td>{cmd.help_text or cmd.label}</td></tr>"
+            for cmd in self._commands if cmd.shortcut
+        )
         QMessageBox.information(
             self,
             "Keyboard Shortcuts",
             "<table cellspacing=6>"
-            "<tr><td><b>Space</b></td><td>Play / Pause</td></tr>"
-            "<tr><td><b>S</b></td><td>Sync current line to playback, advance</td></tr>"
+            f"{rows}"
+            # Handled inside each line's own text field, not a global
+            # shortcut — not part of the command table above.
             "<tr><td><b>Enter</b> (in a line)</td><td>Move to the next line</td></tr>"
-            "<tr><td><b>&uarr; / &darr;</b></td><td>Select previous / next line</td></tr>"
-            "<tr><td><b>&larr; / &rarr;</b></td><td>Seek -5s / +5s</td></tr>"
-            "<tr><td><b>Ctrl+S</b></td><td>Save LRC</td></tr>"
-            "<tr><td><b>Ctrl+Z</b></td><td>Undo last sync</td></tr>"
-            "<tr><td><b>Ctrl+T</b></td><td>Sort lines by time</td></tr>"
-            "<tr><td><b>Ctrl+Shift+O</b></td><td>Shift all timestamps</td></tr>"
-            "<tr><td><b>Ctrl+O</b></td><td>Add files</td></tr>"
             "</table>",
         )
 
@@ -503,12 +549,6 @@ class LrcSyncApp(QMainWindow):
         self.file_list.itemDoubleClicked.connect(self._load_selected_file)
         layout.addWidget(self.file_list)
 
-        btn_style = (
-            "QPushButton { background-color: #313244; color: white;"
-            " border: 1px solid #45475a; padding: 8px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #45475a; }"
-        )
-
         # Two groups, separated so "get more music" and "tidy up what's here"
         # read as distinct actions rather than one undifferentiated stack.
         layout.addWidget(self._make_group_label("Add music"))
@@ -523,7 +563,7 @@ class LrcSyncApp(QMainWindow):
             btn = QPushButton(label)
             btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
-            btn.setStyleSheet(btn_style)
+            btn.setStyleSheet(self._neutral_button_style())
             layout.addWidget(btn)
 
         layout.addWidget(self._make_group_label("Manage"))
@@ -538,11 +578,45 @@ class LrcSyncApp(QMainWindow):
             btn = QPushButton(label)
             btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
-            btn.setStyleSheet(btn_style)
+            btn.setStyleSheet(self._neutral_button_style())
             layout.addWidget(btn)
 
         self._refresh_file_list_placeholder()
         return panel
+
+    @staticmethod
+    def _neutral_button_style() -> str:
+        """The default look for a panel action button — used by every
+        button in the file panel and most of the lyrics panel, so a
+        button's importance (or lack of it) is legible at a glance
+        instead of every button competing for attention with its own
+        color."""
+        return (
+            f"QPushButton {{ background-color: #313244; color: {COLOR_FG.name()};"
+            " border: 1px solid #45475a; padding: 8px; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #45475a; }"
+        )
+
+    @staticmethod
+    def _primary_button_style() -> str:
+        """For the one action per panel worth calling out as primary
+        (currently just Save LRC) — accented, not just bigger/bolder."""
+        return (
+            f"QPushButton {{ background-color: {COLOR_ACCENT.name()}; color: #1e1e2e;"
+            " font-weight: bold; padding: 8px; border-radius: 4px; }"
+            f"QPushButton:hover {{ background-color: {COLOR_ACCENT.lighter(110).name()}; }}"
+        )
+
+    @staticmethod
+    def _danger_button_style() -> str:
+        """For genuinely destructive actions only (currently just Clear
+        All) — an outline rather than a solid fill, so it reads as
+        "careful" without competing with a real error/missing state."""
+        return (
+            f"QPushButton {{ background-color: transparent; color: {COLOR_MISSING.name()};"
+            f" border: 1px solid {COLOR_MISSING.name()}; padding: 8px; border-radius: 4px; }}"
+            f"QPushButton:hover {{ background-color: {COLOR_MISSING.name()}; color: #1e1e2e; }}"
+        )
 
     @staticmethod
     def _make_group_label(text: str) -> QLabel:
@@ -589,29 +663,48 @@ class LrcSyncApp(QMainWindow):
         self.scroll_area.setWidget(self._scroll_content)
         layout.addWidget(self.scroll_area)
 
-        # Bottom control row
-        ctrl = QHBoxLayout()
-        for label, handler, color, tooltip in [
-            ("Save LRC",   self._save_lrc_file,    COLOR_SYNCED,
-             "Save the .lrc sidecar file (Ctrl+S)"),
-            ("Web Search", self._get_lyrics_online, COLOR_ACCENT,
-             "Search online for synced lyrics for this song"),
-            ("Sort Lines", self._sort_verses_by_time, COLOR_UNSYNCED,
+        # Bottom actions. Save is the one action worth calling out as
+        # primary; everything else is grouped the same way the file panel
+        # groups its own buttons, and color is spent the way it's spent
+        # everywhere else in the app — status colors aren't decoration,
+        # so they're not reused here just to make five buttons look less
+        # identical. Clear All is the one genuinely destructive action
+        # and is styled (and placed) to read as separate from the rest.
+        save_btn = QPushButton("Save LRC")
+        save_btn.setToolTip("Save the .lrc sidecar file (Ctrl+S)")
+        save_btn.clicked.connect(self._save_lrc_file)
+        save_btn.setStyleSheet(self._primary_button_style())
+        layout.addWidget(save_btn)
+
+        layout.addWidget(self._make_group_label("Fetch"))
+        fetch_row = QHBoxLayout()
+        web_search_btn = QPushButton("Web Search")
+        web_search_btn.setToolTip("Search online for synced lyrics for this song")
+        web_search_btn.clicked.connect(self._get_lyrics_online)
+        web_search_btn.setStyleSheet(self._neutral_button_style())
+        fetch_row.addWidget(web_search_btn)
+        layout.addLayout(fetch_row)
+
+        layout.addWidget(self._make_group_label("Edit"))
+        edit_row = QHBoxLayout()
+        for label, handler, tooltip in [
+            ("Sort Lines", self._sort_verses_by_time,
              "Reorder verses by their timestamp (Ctrl+T)"),
-            ("Shift All",  self._shift_all_timestamps, COLOR_TIMELINE_BLOCK,
+            ("Shift All", self._shift_all_timestamps,
              "Nudge every timestamp by the same +/- amount — fixes a track that's synced but drifting"),
-            ("Clear All",  self._clear_lyrics,      COLOR_MISSING,
-             "Remove every verse and start this song's lyrics over"),
         ]:
             btn = QPushButton(label)
             btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
-            btn.setStyleSheet(
-                f"QPushButton {{ background-color: {color.name()};"
-                " color: #1e1e2e; font-weight: bold; padding: 8px; border-radius: 4px; }"
-            )
-            ctrl.addWidget(btn)
-        layout.addLayout(ctrl)
+            btn.setStyleSheet(self._neutral_button_style())
+            edit_row.addWidget(btn)
+        layout.addLayout(edit_row)
+
+        clear_btn = QPushButton("Clear All")
+        clear_btn.setToolTip("Remove every verse and start this song's lyrics over")
+        clear_btn.clicked.connect(self._clear_lyrics)
+        clear_btn.setStyleSheet(self._danger_button_style())
+        layout.addWidget(clear_btn)
 
         # Optional: also write lyrics into the audio file's own tags on save.
         self.embed_checkbox = QCheckBox("Also embed lyrics in audio file tags")
@@ -625,20 +718,14 @@ class LrcSyncApp(QMainWindow):
         return panel
 
     def _init_shortcuts(self) -> None:
-        shortcuts: list[tuple[str, object]] = [
-            ("Space",    self._toggle_play_pause_smart),
-            ("s",        self._sync_next_verse),
-            ("Right",    lambda: self._seek_delta(5_000)),
-            ("Left",     lambda: self._seek_delta(-5_000)),
-            ("Up",       lambda: self._select_verse(self.current_verse_index - 1)),
-            ("Down",     lambda: self._select_verse(self.current_verse_index + 1)),
-            ("Ctrl+S",   self._save_lrc_file),
-            ("Ctrl+Z",   self._undo_last_sync),
-            ("Ctrl+T",   self._sort_verses_by_time),
-        ]
-        for key, fn in shortcuts:
-            sc = QShortcut(QKeySequence(key), self)
-            sc.activated.connect(fn)
+        """Register the playback/navigation commands — the only ones with
+        no menu entry (see _build_commands), so QAction's own shortcut
+        handling doesn't cover them and they need a raw QShortcut."""
+        for cmd in self._commands:
+            if cmd.menu is not None or not cmd.shortcut:
+                continue
+            sc = QShortcut(QKeySequence(cmd.shortcut), self)
+            sc.activated.connect(cmd.handler)
 
     # ==================================================================
     # Player controls
@@ -823,6 +910,20 @@ class LrcSyncApp(QMainWindow):
         self._mark_dirty()
 
     def _clear_lyrics(self) -> None:
+        # The one action in the app with no undo path at all — unlike a
+        # sync (Ctrl-Z) or a song switch (caught by the dirty-check
+        # prompt), this destroys every verse immediately. It's the only
+        # button in the whole UI that needed its own confirmation to
+        # match how destructive it actually is.
+        if self._verses and QMessageBox.question(
+            self,
+            "Clear All Lyrics",
+            f"Remove all {len(self._verses)} line(s) for "
+            f"'{self.song_filename}'? This can't be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        ) != QMessageBox.StandardButton.Yes:
+            return
         for v in self._verses:
             self.lyrics_layout.removeWidget(v)
             v.deleteLater()
