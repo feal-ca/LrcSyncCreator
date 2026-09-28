@@ -90,6 +90,7 @@ class DownloadView(QWidget):
 
     files_ready     = pyqtSignal(list)   # list[str]
     open_in_library = pyqtSignal(str)
+    file_downloaded = pyqtSignal(str)    # emitted per completed row, for live library updates
 
     def __init__(
         self,
@@ -197,6 +198,12 @@ class DownloadView(QWidget):
     # ------------------------------------------------------------------
     # Fetch
     # ------------------------------------------------------------------
+
+    def start_fetch(self, link: str) -> None:
+        """Programmatic equivalent of pasting *link* and clicking Fetch —
+        used by the unified Find Music entry point in app.py."""
+        self.link_input.setText(link)
+        self._on_fetch_clicked()
 
     def _on_fetch_clicked(self) -> None:
         link = self.link_input.text().strip()
@@ -432,6 +439,7 @@ class DownloadView(QWidget):
             state.status = "downloaded"
             state.local_path = local_path
             self._newly_downloaded.append(local_path)
+            self.file_downloaded.emit(local_path)
         else:
             state.status = "download_failed"
             state.detail = detail
