@@ -114,3 +114,44 @@ def test_clear_lyrics_skips_the_prompt_when_theres_nothing_to_clear(window, monk
     window._clear_lyrics()
 
     assert asked == []
+
+
+# ---------------------------------------------------------------------------
+# Unified Find Music entry point
+# ---------------------------------------------------------------------------
+
+def test_find_music_routes_spotify_link_to_batch_import(window, monkeypatch):
+    from PyQt6.QtWidgets import QDialog
+
+    calls = []
+    monkeypatch.setattr(window, "_get_slskd_client", lambda: object())
+    monkeypatch.setattr(window, "_open_batch_import", lambda link: calls.append(link))
+    # dialog.exec() is modal and blocks in real use — run_search is wired
+    # to the Search button *before* exec() is called, so replacing exec()
+    # with a no-op that returns immediately (Rejected) lets _find_music()
+    # return control to the test without ever blocking, while leaving the
+    # live dialog object and its button wiring fully intact to drive by
+    # hand afterward.
+    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
+
+    # is_spotify_link() requires a genuine 22-character Spotify ID (same
+    # regex extract_spotify_ref() already enforces) — a short fake ID like
+    # "abc123" wouldn't match, so run_search() would silently fall through
+    # to the real-Soulseek-search branch and start a real SoulseekSearchThread
+    # against this test's dummy `object()` client, crashing the process
+    # when that thread calls a `.search()` method the dummy doesn't have.
+    spotify_link = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+
+    window._find_music()
+    dialog = window._active_find_music_dialog
+    dialog.query_input.setText(spotify_link)
+    dialog.search_button.click()
+
+    assert calls == [spotify_link]
+
+
+def test_command_table_has_one_find_music_entry_not_two(window):
+    labels = [cmd.label for cmd in window._commands]
+    assert "Find Music…" in labels
+    assert "Find on Soulseek…" not in labels
+    assert "Import from Spotify" not in labels

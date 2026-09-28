@@ -63,6 +63,7 @@ from dialogs import SettingsDialog, SoulseekSearchDialog, ValidateSyncDialog
 from download_view import DownloadView
 from library_panel import LibraryPanel
 from soulseek import SlskdClient, SoulseekFile
+from spotify_playlist import is_spotify_link
 from widgets import TimelineWidget, Verse
 from workers import (
     LyricsDownloaderThread,
@@ -323,6 +324,7 @@ class LrcSyncApp(QMainWindow):
         self.library_panel = LibraryPanel(self.settings)
         self.library_panel.song_selected.connect(self._on_library_song_selected)
         self.library_panel.file_renamed.connect(self._on_file_renamed)
+        self.library_panel.find_music_requested.connect(self._find_music)
         self.splitter.addWidget(self.library_panel)
         self.splitter.addWidget(self._build_lyrics_panel())
         self.splitter.setStretchFactor(0, 1)
@@ -359,9 +361,6 @@ class LrcSyncApp(QMainWindow):
         self._load_song(path)
         self.library_panel.select_path(path)
 
-    def _go_to_download_tab(self) -> None:
-        self.tabs.setCurrentWidget(self.download_view)
-
     def _build_commands(self) -> list[_Command]:
         """The single source of truth for every keyboard-triggerable
         action — see ``_Command`` for what building from this buys.
@@ -396,10 +395,7 @@ class LrcSyncApp(QMainWindow):
             _Command("Shift All Timestamps…", "Ctrl+Shift+O", self._shift_all_timestamps, "edit"),
             _Command("Clear All Lyrics", None, self._clear_lyrics, "edit", separator_before=True),
 
-            _Command("Find on Soulseek…", "Ctrl+F", self._find_on_soulseek, "tools"),
-            # No "…": unlike its neighbors, this doesn't open a dialog —
-            # it just switches to the already-one-click-away Download tab.
-            _Command("Import from Spotify", None, self._go_to_download_tab, "tools"),
+            _Command("Find Music…", "Ctrl+F", self._find_music, "tools"),
             _Command("Validate Sync…", None, self._validate_sync, "tools"),
             _Command("Settings…", None, self._open_settings_dialog, "tools", separator_before=True),
 
@@ -1249,7 +1245,7 @@ class LrcSyncApp(QMainWindow):
     def _open_settings_dialog(self) -> None:
         SettingsDialog(self.settings, self).exec()
 
-    def _find_on_soulseek(self) -> None:
+    def _find_music(self) -> None:
         if self._soulseek_download_thread is not None and self._soulseek_download_thread.isRunning():
             QMessageBox.information(
                 self, "Soulseek Download In Progress",
@@ -1262,12 +1258,20 @@ class LrcSyncApp(QMainWindow):
         if client is None:
             return
 
-        default_query = os.path.splitext(self.song_filename)[0] if self.song_filename else ""
-        dialog = SoulseekSearchDialog(default_query, self)
+        dialog = SoulseekSearchDialog("", self)
+        dialog.query_input.setPlaceholderText("Search Soulseek, or paste a Spotify link…")
+        self._active_find_music_dialog = dialog   # exposed for testability
 
         def run_search() -> None:
+            query = dialog.query_input.text().strip()
+            if not query:
+                return
+            if is_spotify_link(query):
+                dialog.reject()
+                self._open_batch_import(query)
+                return
             dialog.set_searching(True)
-            self._soulseek_search_thread = SoulseekSearchThread(client, dialog.query_input.text().strip())
+            self._soulseek_search_thread = SoulseekSearchThread(client, query)
             self._soulseek_search_thread.results_ready.connect(
                 lambda results: (dialog.set_searching(False), dialog.show_results(results))
             )
@@ -1277,11 +1281,12 @@ class LrcSyncApp(QMainWindow):
             self._soulseek_search_thread.start()
 
         dialog.search_button.clicked.connect(run_search)
-        if dialog.query_input.text().strip():
-            run_search()
 
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_file:
             self._start_soulseek_download(client, dialog.selected_file, auto_fetch_lyrics=True)
+
+    def _open_batch_import(self, link: str) -> None:
+        raise NotImplementedError  # implemented in Task 6
 
     def _start_soulseek_download(
         self, client: SlskdClient, file: SoulseekFile, auto_fetch_lyrics: bool,
