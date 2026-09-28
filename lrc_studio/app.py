@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from functools import partial
 
 import mutagen
@@ -31,7 +32,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSplitter, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from constants import (
@@ -40,6 +41,7 @@ from constants import (
     COLOR_BG,
     COLOR_FG,
     COLOR_MISSING,
+    COLOR_MUTED,
     COLOR_SYNCED,
     COLOR_TIMELINE_BG,
     COLOR_TIMELINE_BLOCK,
@@ -59,7 +61,8 @@ from utils import (
     write_embedded_lyrics,
 )
 import lyrics_qa
-from dialogs import SettingsDialog, SoulseekSearchDialog, SpotifyImportDialog, ValidateSyncDialog
+from dialogs import SettingsDialog, SoulseekSearchDialog, ValidateSyncDialog
+from download_view import DownloadView
 from soulseek import SlskdClient, SoulseekFile
 from widgets import TimelineWidget, Verse
 from workers import (
@@ -68,7 +71,6 @@ from workers import (
     LyricsSearchThread,
     SoulseekDownloadThread,
     SoulseekSearchThread,
-    SpotifyImportThread,
 )
 
 
@@ -96,7 +98,7 @@ class LrcSyncApp(QMainWindow):
         self._verse_timestamps:  list[int]   = []
 
         # Undo stack: list of (verse_index, old_timestamp_str) snapshots
-        self._undo_stack: list[tuple[int, str]] = []
+        self._undo_stack: list[tuple[Verse, str]] = []
 
         # Seek-bar drag state (preserves play/pause across slider drags)
         self._was_playing_before_drag: bool = False
@@ -111,8 +113,11 @@ class LrcSyncApp(QMainWindow):
         # Soulseek search/download thread references (kept to avoid GC)
         self._soulseek_search_thread: SoulseekSearchThread | None = None
         self._soulseek_download_thread: SoulseekDownloadThread | None = None
-        self._spotify_import_thread: SpotifyImportThread | None = None
         self._qa_thread: LyricsQAThread | None = None
+        # slskd process we spawned ourselves (None if the user is running
+        # their own instance, or we haven't tried to start one yet) — only
+        # ever terminated on app exit if we're the one who started it.
+        self._slskd_process: subprocess.Popen | None = None
 
         # Unsaved-changes tracking — drives the save-before-switch/close prompt.
         self._dirty: bool = False
@@ -256,8 +261,19 @@ class LrcSyncApp(QMainWindow):
 
         self._build_menu_bar()
 
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        self.tabs.addTab(self._build_library_tab(), "Library")
+
+        self.download_view = DownloadView(
+            self.settings, self._get_slskd_client, self._collect_library_paths, self,
+        )
+        self.download_view.files_ready.connect(self._on_download_files_ready)
+        self.download_view.open_in_library.connect(self._open_in_library)
+        self.tabs.addTab(self.download_view, "Download")
+
+    def _build_library_tab(self) -> QWidget:
         root = QWidget()
-        self.setCentralWidget(root)
         main = QVBoxLayout(root)
         main.setContentsMargins(15, 15, 15, 15)
         main.setSpacing(10)
@@ -307,6 +323,25 @@ class LrcSyncApp(QMainWindow):
         stat_row.addWidget(self.progress_bar)
         main.addLayout(stat_row)
 
+        return root
+
+    def _on_download_files_ready(self, paths: list[str]) -> None:
+        self._process_added_files(paths)
+        self._fetch_lyrics_for(paths)
+
+    def _open_in_library(self, path: str) -> None:
+        self.tabs.setCurrentWidget(self.tabs.widget(0))
+        if not self._confirm_discard_if_dirty():
+            return
+        self._load_song(path)
+        for item in self._real_file_items():
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                self.file_list.setCurrentItem(item)
+                break
+
+    def _go_to_download_tab(self) -> None:
+        self.tabs.setCurrentWidget(self.download_view)
+
     def _build_menu_bar(self) -> None:
         menu = self.menuBar()
 
@@ -325,7 +360,7 @@ class LrcSyncApp(QMainWindow):
 
         tools_menu = menu.addMenu("&Tools")
         self._add_action(tools_menu, "Find on Soulseek…", "Ctrl+F", self._find_on_soulseek)
-        self._add_action(tools_menu, "Import Spotify Playlist…", None, self._import_spotify_playlist)
+        self._add_action(tools_menu, "Import from Spotify…", None, self._go_to_download_tab)
         self._add_action(tools_menu, "Validate Sync…", None, self._validate_sync)
         tools_menu.addSeparator()
         self._add_action(tools_menu, "Settings…", None, self._open_settings_dialog)
@@ -472,20 +507,70 @@ class LrcSyncApp(QMainWindow):
             " border: 1px solid #45475a; padding: 8px; border-radius: 4px; }"
             "QPushButton:hover { background-color: #45475a; }"
         )
-        for label, handler in [
-            ("Add Files",          self._add_files_dialog),
-            ("Find on Soulseek",   self._find_on_soulseek),
-            ("Import Spotify Playlist", self._import_spotify_playlist),
-            ("Standardize Names",  self._batch_rename_files),
-            ("Download Lyrics",    self._batch_download_lyrics),
-            ("Clear Completed",    self._remove_completed_files),
+
+        # Two groups, separated so "get more music" and "tidy up what's here"
+        # read as distinct actions rather than one undifferentiated stack.
+        layout.addWidget(self._make_group_label("Add music"))
+        for label, handler, tooltip in [
+            ("Add Files", self._add_files_dialog,
+             "Browse for audio files to add to the list"),
+            ("Find on Soulseek", self._find_on_soulseek,
+             "Search Soulseek for a track and download it into your library"),
+            ("Import from Spotify", self._go_to_download_tab,
+             "Switch to the Download tab to import a Spotify track, album, or playlist"),
         ]:
             btn = QPushButton(label)
+            btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
             btn.setStyleSheet(btn_style)
             layout.addWidget(btn)
 
+        layout.addWidget(self._make_group_label("Manage"))
+        for label, handler, tooltip in [
+            ("Standardize Names", self._batch_rename_files,
+             "Rename files to \"Artist - Title\" based on their tags"),
+            ("Download Lyrics", self._batch_download_lyrics,
+             "Fetch synced lyrics for every file that's missing them"),
+            ("Clear Completed", self._remove_completed_files,
+             "Remove fully-synced files from this list (their files aren't touched)"),
+        ]:
+            btn = QPushButton(label)
+            btn.setToolTip(tooltip)
+            btn.clicked.connect(handler)
+            btn.setStyleSheet(btn_style)
+            layout.addWidget(btn)
+
+        self._refresh_file_list_placeholder()
         return panel
+
+    @staticmethod
+    def _make_group_label(text: str) -> QLabel:
+        label = QLabel(text.upper())
+        label.setStyleSheet(
+            f"color: {COLOR_MUTED.name()}; font-size: 10px; font-weight: bold;"
+            " letter-spacing: 1px; margin-top: 6px;"
+        )
+        return label
+
+    def _refresh_file_list_placeholder(self) -> None:
+        """Keep a hint item in the file list whenever it holds no real files."""
+        for i in range(self.file_list.count() - 1, -1, -1):
+            if not self.file_list.item(i).data(Qt.ItemDataRole.UserRole):
+                self.file_list.takeItem(i)
+        if self.file_list.count() == 0:
+            placeholder = QListWidgetItem(
+                "Drag audio files here, or click \"Add Files\" below"
+            )
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            placeholder.setForeground(COLOR_MUTED)
+            self.file_list.addItem(placeholder)
+
+    def _real_file_items(self) -> list[QListWidgetItem]:
+        """file_list items backed by an actual path (excludes the placeholder)."""
+        return [
+            self.file_list.item(i) for i in range(self.file_list.count())
+            if self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
+        ]
 
     def _build_lyrics_panel(self) -> QWidget:
         panel = QWidget()
@@ -505,14 +590,20 @@ class LrcSyncApp(QMainWindow):
 
         # Bottom control row
         ctrl = QHBoxLayout()
-        for label, handler, color in [
-            ("Save LRC",   self._save_lrc_file,    COLOR_SYNCED),
-            ("Web Search", self._get_lyrics_online, COLOR_ACCENT),
-            ("Sort Lines", self._sort_verses_by_time, COLOR_UNSYNCED),
-            ("Shift All",  self._shift_all_timestamps, COLOR_TIMELINE_BLOCK),
-            ("Clear All",  self._clear_lyrics,      COLOR_MISSING),
+        for label, handler, color, tooltip in [
+            ("Save LRC",   self._save_lrc_file,    COLOR_SYNCED,
+             "Save the .lrc sidecar file (Ctrl+S)"),
+            ("Web Search", self._get_lyrics_online, COLOR_ACCENT,
+             "Search online for synced lyrics for this song"),
+            ("Sort Lines", self._sort_verses_by_time, COLOR_UNSYNCED,
+             "Reorder verses by their timestamp (Ctrl+T)"),
+            ("Shift All",  self._shift_all_timestamps, COLOR_TIMELINE_BLOCK,
+             "Nudge every timestamp by the same +/- amount — fixes a track that's synced but drifting"),
+            ("Clear All",  self._clear_lyrics,      COLOR_MISSING,
+             "Remove every verse and start this song's lyrics over"),
         ]:
             btn = QPushButton(label)
+            btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
             btn.setStyleSheet(
                 f"QPushButton {{ background-color: {color.name()};"
@@ -770,8 +861,7 @@ class LrcSyncApp(QMainWindow):
         """Stamp *verse* with the current playback position - SYNC_OFFSET."""
         # Save old timestamp to undo stack before overwriting.
         if verse in self._verses:
-            idx = self._verses.index(verse)
-            self._undo_stack.append((idx, verse.get_timestamp()))
+            self._undo_stack.append((verse, verse.get_timestamp()))
             if len(self._undo_stack) > MAX_UNDO:
                 self._undo_stack.pop(0)
 
@@ -788,16 +878,24 @@ class LrcSyncApp(QMainWindow):
         self._select_verse(self.current_verse_index + 1)
 
     def _undo_last_sync(self) -> None:
-        """Revert the most recent sync operation (Ctrl-Z)."""
-        if not self._undo_stack:
-            self.status_bar.setText("Nothing to undo.")
-            return
-        idx, old_ts = self._undo_stack.pop()
-        if 0 <= idx < len(self._verses):
-            self._verses[idx].set_timestamp(old_ts)
+        """Revert the most recent sync operation (Ctrl-Z).
+
+        Undo entries are keyed by verse identity rather than list index, so
+        a reorder (sort) or a delete of an unrelated line can't make this
+        restore a timestamp onto the wrong verse. Entries for verses that
+        no longer exist are skipped rather than applied.
+        """
+        while self._undo_stack:
+            verse, old_ts = self._undo_stack.pop()
+            if verse not in self._verses:
+                continue
+            idx = self._verses.index(verse)
+            verse.set_timestamp(old_ts)
             self._update_timeline()
             self._mark_dirty()
             self.status_bar.setText(f"Undid sync on line {idx + 1}.")
+            return
+        self.status_bar.setText("Nothing to undo.")
 
     def _sort_verses_by_time(self) -> None:
         """Sort all verses in ascending timestamp order (Ctrl-T)."""
@@ -829,9 +927,9 @@ class LrcSyncApp(QMainWindow):
         )
         if not ok or delta == 0:
             return
-        for i, verse in enumerate(self._verses):
+        for verse in self._verses:
             old_ts = verse.get_timestamp()
-            self._undo_stack.append((i, old_ts))
+            self._undo_stack.append((verse, old_ts))
             if len(self._undo_stack) > MAX_UNDO:
                 self._undo_stack.pop(0)
             new_ms = max(0, parse_lrc_timestamp(old_ts) + delta)
@@ -955,11 +1053,13 @@ class LrcSyncApp(QMainWindow):
         item.setToolTip(tip)
 
     def _process_added_files(self, file_paths: list[str]) -> None:
-        # Use a set for O(1) duplicate detection.
-        existing: set[str] = {
-            self.file_list.item(i).data(Qt.ItemDataRole.UserRole)
-            for i in range(self.file_list.count())
-        }
+        # Don't strip the placeholder before adding: _refresh_file_list_placeholder()
+        # re-inserts a fresh one the instant the list is empty, which it always
+        # is right here on a first add — leaving that placeholder sitting at
+        # index 0 once real items get appended after it. _real_file_items()
+        # already excludes the placeholder (no UserRole data) without needing
+        # it physically removed first, so building `existing` from it is safe.
+        existing: set[str] = {item.data(Qt.ItemDataRole.UserRole) for item in self._real_file_items()}
         for path in file_paths:
             if (
                 os.path.isfile(path)
@@ -972,7 +1072,12 @@ class LrcSyncApp(QMainWindow):
                 self.file_list.addItem(item)
                 existing.add(path)
 
-        if not self.song_is_loaded and self.file_list.count() > 0:
+        self._refresh_file_list_placeholder()
+
+        # Checked via _real_file_items(), not file_list.count(): if nothing new
+        # was actually added (e.g. all duplicates), the placeholder above gets
+        # re-created and would otherwise be mistaken for a loadable row 0.
+        if not self.song_is_loaded and self._real_file_items():
             self._load_file_from_index(0)
 
     def _add_files_dialog(self) -> None:
@@ -988,11 +1093,11 @@ class LrcSyncApp(QMainWindow):
             self._process_added_files(files)
 
     def _batch_rename_files(self) -> None:
-        if self.file_list.count() == 0:
+        items = self._real_file_items()
+        if not items:
             return
         renamed = 0
-        for i in range(self.file_list.count()):
-            item     = self.file_list.item(i)
+        for item in items:
             old_path = item.data(Qt.ItemDataRole.UserRole)
             ext      = os.path.splitext(old_path)[1]
             try:
@@ -1027,6 +1132,7 @@ class LrcSyncApp(QMainWindow):
             item = self.file_list.item(i)
             if item.foreground().color() == COLOR_SYNCED:
                 self.file_list.takeItem(i)
+        self._refresh_file_list_placeholder()
 
     def _batch_download_lyrics(self) -> None:
         files: list[str] = []
@@ -1063,8 +1169,7 @@ class LrcSyncApp(QMainWindow):
             parts.append(f"Failed: {len(failed)}.")
         self.status_bar.setText("  ".join(parts))
 
-        for i in range(self.file_list.count()):
-            item = self.file_list.item(i)
+        for item in self._real_file_items():
             self._update_file_status_color(
                 item, item.data(Qt.ItemDataRole.UserRole)
             )
@@ -1103,17 +1208,97 @@ class LrcSyncApp(QMainWindow):
                 self,
                 "Soulseek Not Configured",
                 "Set up slskd first:\n\n"
-                "  ./scripts/setup_slskd.sh\n"
-                "  ./scripts/run_slskd.sh\n\n"
-                "Then fill in its URL and API key under Tools → Settings.",
+                "  ./scripts/setup_slskd.sh\n\n"
+                "Then fill in its URL and API key under Tools → Settings — "
+                "LRC Studio will start slskd itself from there on.",
             )
             return None
-        return SlskdClient(url, key)
+
+        client = SlskdClient(url, key)
+        ok, _ = client.check_connection()
+        if ok:
+            return client
+
+        if not self._ensure_slskd_running():
+            return None
+        if self._wait_for_slskd(client):
+            return client
+
+        QMessageBox.warning(
+            self,
+            "Soulseek Unavailable",
+            f"slskd didn't come up in time at {url}. Run ./scripts/run_slskd.sh "
+            "yourself to see what's going wrong, or check its URL/API key under "
+            "Tools → Settings.",
+        )
+        return None
+
+    def _ensure_slskd_running(self) -> bool:
+        """Launch slskd via ``scripts/run_slskd.sh`` if it isn't already
+        running under us. Returns False (with an explanatory dialog) only
+        when we can't even attempt to start it — e.g. the binary was never
+        installed via ``setup_slskd.sh``.
+        """
+        if self._slskd_process is not None and self._slskd_process.poll() is None:
+            return True  # already starting/running from a previous call
+
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script_path = os.path.join(root_dir, "scripts", "run_slskd.sh")
+        binary_path = os.path.join(root_dir, "slskd-bin", "slskd")
+        if not os.path.isfile(binary_path):
+            QMessageBox.information(
+                self,
+                "Soulseek Not Set Up",
+                "slskd isn't installed yet. Run this once from a terminal:\n\n"
+                "  ./scripts/setup_slskd.sh\n\n"
+                "Then fill in its credentials in slskd-bin/slskd.yml and try again.",
+            )
+            return False
+
+        self.status_bar.setText("Starting slskd…")
+        QApplication.processEvents()
+        try:
+            self._slskd_process = subprocess.Popen(
+                [script_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "Couldn't Start slskd", f"Failed to launch {script_path}: {exc}",
+            )
+            return False
+        return True
+
+    def _wait_for_slskd(self, client: SlskdClient, timeout_s: float = 25.0) -> bool:
+        """Block (while pumping the event loop) until *client* reports a
+        live, logged-in slskd, or *timeout_s* elapses."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if self._slskd_process is not None and self._slskd_process.poll() is not None:
+                return False  # the process we started already exited
+            ok, msg = client.check_connection()
+            if ok:
+                self.status_bar.setText(msg)
+                return True
+            self.status_bar.setText(f"Starting slskd… ({msg})")
+            QApplication.processEvents()
+            time.sleep(0.5)
+            QApplication.processEvents()
+        return False
 
     def _open_settings_dialog(self) -> None:
         SettingsDialog(self.settings, self).exec()
 
     def _find_on_soulseek(self) -> None:
+        if self._soulseek_download_thread is not None and self._soulseek_download_thread.isRunning():
+            QMessageBox.information(
+                self, "Soulseek Download In Progress",
+                "A Soulseek download is already running — wait for it to "
+                "finish before starting another one.",
+            )
+            return
+
         client = self._get_slskd_client()
         if client is None:
             return
@@ -1167,7 +1352,7 @@ class LrcSyncApp(QMainWindow):
         QMessageBox.warning(self, "Download Failed", message)
 
     # ==================================================================
-    # Spotify playlist import (paste-a-link, no developer credentials)
+    # Library dedup (shared with the Download tab)
     # ==================================================================
 
     def _collect_library_paths(self) -> list[str]:
@@ -1184,59 +1369,9 @@ class LrcSyncApp(QMainWindow):
                 for fname in files:
                     if fname.lower().endswith(AUDIO_EXTENSIONS):
                         paths.add(os.path.join(root, fname))
-        for i in range(self.file_list.count()):
-            paths.add(self.file_list.item(i).data(Qt.ItemDataRole.UserRole))
+        for item in self._real_file_items():
+            paths.add(item.data(Qt.ItemDataRole.UserRole))
         return list(paths)
-
-    def _import_spotify_playlist(self) -> None:
-        client = self._get_slskd_client()
-        if client is None:
-            return
-
-        dialog = SpotifyImportDialog(self)
-
-        def start_import() -> None:
-            link = dialog.link_input.text().strip()
-            if not link:
-                return
-            dialog.set_busy(True)
-            dialog.log_list.clear()
-
-            downloads_dir = str(self.settings.value("slskd_downloads_dir", "")).strip()
-            library_dir = str(self.settings.value("library_dir", "")).strip() or os.getcwd()
-            library_paths = self._collect_library_paths()
-
-            self._spotify_import_thread = SpotifyImportThread(
-                client, downloads_dir, library_dir, link, library_paths,
-            )
-            self._spotify_import_thread.progress.connect(dialog.log)
-            self._spotify_import_thread.track_done.connect(
-                lambda label, ok, detail: dialog.log(f"{'✓' if ok else '✗'} {label} — {detail}")
-            )
-            self._spotify_import_thread.fetch_failed.connect(
-                lambda msg: (dialog.log(f"Failed: {msg}"), dialog.set_busy(False))
-            )
-            self._spotify_import_thread.finished_import.connect(
-                lambda paths, skipped_existing, skipped_missing:
-                    self._on_spotify_import_finished(dialog, paths, skipped_existing, skipped_missing)
-            )
-            self._spotify_import_thread.start()
-
-        dialog.import_button.clicked.connect(start_import)
-        dialog.exec()
-
-    def _on_spotify_import_finished(
-        self, dialog: SpotifyImportDialog, new_paths: list[str],
-        skipped_existing: int, skipped_no_result: int,
-    ) -> None:
-        dialog.set_busy(False)
-        dialog.log(
-            f"Done — {len(new_paths)} downloaded, {skipped_existing} already in "
-            f"your library, {skipped_no_result} not found on Soulseek."
-        )
-        if new_paths:
-            self._process_added_files(new_paths)
-            self._fetch_lyrics_for(new_paths)
 
     # ==================================================================
     # Optional sync validation (faster-whisper spot-check)
@@ -1317,6 +1452,9 @@ class LrcSyncApp(QMainWindow):
         splitter_state = self.settings.value("splitter_state")
         if splitter_state is not None:
             self.splitter.restoreState(splitter_state)
+        last_tab = self.settings.value("last_tab", 0, type=int)
+        if 0 <= last_tab < self.tabs.count():
+            self.tabs.setCurrentIndex(last_tab)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if not self._confirm_discard_if_dirty():
@@ -1324,6 +1462,9 @@ class LrcSyncApp(QMainWindow):
             return
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
+        self.settings.setValue("last_tab", self.tabs.currentIndex())
+        if self._slskd_process is not None and self._slskd_process.poll() is None:
+            self._slskd_process.terminate()
         event.accept()
 
     # ==================================================================

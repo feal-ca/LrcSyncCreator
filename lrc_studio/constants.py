@@ -48,6 +48,7 @@ BUTTON_SIZE: int = 28   # px — square action buttons on each Verse row
 
 COLOR_BG             = QColor("#1e1e2e")   # main window background
 COLOR_FG             = QColor("#cdd6f4")   # primary text
+COLOR_MUTED          = QColor("#6c7086")   # placeholders, secondary/group labels
 COLOR_ACCENT         = QColor("#89b4fa")   # interactive elements / playhead
 COLOR_SYNCED         = QColor("#a6e3a1")   # file has good synced LRC
 COLOR_UNSYNCED       = QColor("#f9e2af")   # file has LRC but timestamps are all 0

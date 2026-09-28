@@ -7,10 +7,11 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QSettings
 from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QProgressBar, QPushButton,
+    QVBoxLayout,
 )
 
 from constants import COLOR_MISSING, COLOR_SYNCED, COLOR_UNSYNCED
@@ -38,7 +39,9 @@ class SettingsDialog(QDialog):
         test_row = QHBoxLayout()
         self.test_button = QPushButton("Test Connection")
         self.test_button.clicked.connect(self._test_connection)
-        self.test_status = QLabel("Run ./scripts/setup_slskd.sh once, then ./scripts/run_slskd.sh")
+        self.test_status = QLabel(
+            "Run ./scripts/setup_slskd.sh once — LRC Studio starts slskd itself after that"
+        )
         self.test_status.setWordWrap(True)
         test_row.addWidget(self.test_button)
         test_row.addWidget(self.test_status, stretch=1)
@@ -130,6 +133,13 @@ class SoulseekSearchDialog(QDialog):
         self.status_label = QLabel("Enter a search and press Search.")
         layout.addWidget(self.status_label)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)   # indeterminate — we don't know peer response count in advance
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setMaximumHeight(6)
+        layout.addWidget(self.progress_bar)
+
         self.result_list = QListWidget()
         layout.addWidget(self.result_list, stretch=1)
 
@@ -144,6 +154,7 @@ class SoulseekSearchDialog(QDialog):
     def set_searching(self, is_searching: bool) -> None:
         self.search_button.setEnabled(not is_searching)
         self.query_input.setEnabled(not is_searching)
+        self.progress_bar.setVisible(is_searching)
         if is_searching:
             self.status_label.setText("Searching Soulseek… (waiting for peer responses)")
             self.result_list.clear()
@@ -170,45 +181,6 @@ class SoulseekSearchDialog(QDialog):
             self.accept()
         else:
             self.status_label.setText("Select a result first.")
-
-
-class SpotifyImportDialog(QDialog):
-    """Paste a playlist link, watch the fetch → dedup → Soulseek pipeline run.
-
-    A log view rather than a track-by-track picker — for a playlist-sized
-    batch, a running log is more useful than a UI you'd have to babysit.
-    """
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle("Import Spotify Playlist")
-        self.setMinimumSize(560, 400)
-
-        layout = QVBoxLayout(self)
-
-        row = QHBoxLayout()
-        self.link_input = QLineEdit()
-        self.link_input.setPlaceholderText("Paste a Spotify playlist link…")
-        self.import_button = QPushButton("Import Missing Tracks")
-        row.addWidget(self.link_input, stretch=1)
-        row.addWidget(self.import_button)
-        layout.addLayout(row)
-
-        self.log_list = QListWidget()
-        layout.addWidget(self.log_list, stretch=1)
-
-        self.close_button = QPushButton("Close")
-        self.close_button.clicked.connect(self.accept)
-        layout.addWidget(self.close_button)
-
-    def log(self, message: str) -> None:
-        self.log_list.addItem(message)
-        self.log_list.scrollToBottom()
-
-    def set_busy(self, busy: bool) -> None:
-        self.import_button.setEnabled(not busy)
-        self.link_input.setEnabled(not busy)
-        self.close_button.setEnabled(not busy)
 
 
 class ValidateSyncDialog(QDialog):
