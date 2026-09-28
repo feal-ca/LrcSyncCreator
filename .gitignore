@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 M/
+.worktrees/
 
 # slskd is downloaded locally by scripts/setup_slskd.sh, and its config
 # holds your Soulseek account credentials + API key — never commit it.
