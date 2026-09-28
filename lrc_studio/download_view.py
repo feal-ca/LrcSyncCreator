@@ -30,7 +30,7 @@ from dialogs import SoulseekSearchDialog
 from soulseek import SlskdClient, SoulseekFile
 from workers import (
     PlaylistDownloadThread, PlaylistFetchThread, PlaylistSearchThread,
-    SoulseekSearchThread,
+    SoulseekSearchThread, stop_thread,
 )
 
 _STATUS_LABELS = {
@@ -113,6 +113,14 @@ class DownloadView(QWidget):
         self._current_cancel_target = None
 
         self._build_ui()
+
+    def shutdown(self) -> None:
+        """Stop any in-flight threads. Call from the main window's
+        closeEvent so closing mid-fetch/search/download doesn't crash."""
+        stop_thread(self._fetch_thread)
+        stop_thread(self._search_thread)
+        stop_thread(self._download_thread)
+        stop_thread(self._adhoc_search_thread)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -319,7 +327,10 @@ class DownloadView(QWidget):
 
     def _choose_match(self, row_index: int) -> None:
         state = self._rows[row_index]
-        dialog = SoulseekSearchDialog(state.track.query, self)
+        # Prefill with the title alone, not "artist title" — Soulseek's
+        # search tends to do better on a narrower query that a person can
+        # then eyeball-filter by artist, same as searching it by hand.
+        dialog = SoulseekSearchDialog(state.track.title, self)
         dialog.show_results(state.candidates)
 
         def run_search() -> None:

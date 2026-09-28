@@ -71,6 +71,7 @@ from workers import (
     LyricsSearchThread,
     SoulseekDownloadThread,
     SoulseekSearchThread,
+    stop_thread,
 )
 
 
@@ -1224,14 +1225,40 @@ class LrcSyncApp(QMainWindow):
         if self._wait_for_slskd(client):
             return client
 
+        # slskd's process was alive the whole wait but never reached a
+        # logged-in state — most often it lost its Soulseek connection
+        # earlier in the session and isn't reconnecting on its own.
+        # Waiting longer doesn't help that; a fresh restart usually does.
+        # Only do this for a process we launched ourselves — never kill
+        # an instance the user is running (and watching) by hand.
+        if self._slskd_process is not None and self._restart_slskd():
+            if self._wait_for_slskd(client):
+                return client
+
         QMessageBox.warning(
             self,
             "Soulseek Unavailable",
-            f"slskd didn't come up in time at {url}. Run ./scripts/run_slskd.sh "
-            "yourself to see what's going wrong, or check its URL/API key under "
-            "Tools → Settings.",
+            f"slskd didn't come up in time at {url}, even after a restart. "
+            "Run ./scripts/run_slskd.sh yourself to see what's going wrong, "
+            "or check its URL/API key under Tools → Settings.",
         )
         return None
+
+    def _restart_slskd(self) -> bool:
+        """Kill and relaunch the slskd process we control."""
+        if self._slskd_process is not None and self._slskd_process.poll() is None:
+            self.status_bar.setText("slskd seems stuck — restarting it…")
+            QApplication.processEvents()
+            try:
+                self._slskd_process.terminate()
+                self._slskd_process.wait(timeout=5)
+            except Exception:
+                try:
+                    self._slskd_process.kill()
+                except Exception:
+                    pass
+        self._slskd_process = None
+        return self._ensure_slskd_running()
 
     def _ensure_slskd_running(self) -> bool:
         """Launch slskd via ``scripts/run_slskd.sh`` if it isn't already
@@ -1463,6 +1490,18 @@ class LrcSyncApp(QMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
         self.settings.setValue("last_tab", self.tabs.currentIndex())
+
+        # Stop any in-flight background work before the window (and the
+        # QThread objects with it) goes away — otherwise Qt either warns
+        # loudly ("QThread: Destroyed while thread is still running") or
+        # crashes outright.
+        stop_thread(self._search_thread)
+        stop_thread(self._soulseek_search_thread)
+        stop_thread(self._soulseek_download_thread)
+        stop_thread(self._qa_thread)
+        stop_thread(self._downloader)
+        self.download_view.shutdown()
+
         if self._slskd_process is not None and self._slskd_process.poll() is None:
             self._slskd_process.terminate()
         event.accept()

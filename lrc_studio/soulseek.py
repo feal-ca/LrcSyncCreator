@@ -15,12 +15,43 @@ during development.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass
 
 import requests
+from rapidfuzz import fuzz
 
 AUDIO_EXTENSIONS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus")
+
+# Below this fuzzy relevance score (0-100) a search result is dropped as
+# "probably not the right song" rather than just ranked lower. Looser than
+# spotify_playlist.py's 80 (used for tag-derived library entries) because
+# this compares against raw, uploader-chosen remote filenames/paths —
+# track numbers, quality tags, and folder structure add noise that a
+# clean "artist title" string doesn't have.
+_DEFAULT_RELEVANCE_THRESHOLD = 65
+
+# Parenthetical/bracketed asides ("(feat. X)", "[Explicit]") and trailing
+# version/remaster suffixes ("- Remastered 2011", "- Radio Edit") are
+# common in Spotify metadata but rarely appear verbatim in how peers name
+# their files — stripping them before searching casts a wider net, the
+# same way manually simplifying a query to just the title does.
+_BRACKETED_RE = re.compile(r"[\(\[][^)\]]*[\)\]]")
+_NOISE_SUFFIX_RE = re.compile(
+    r"\s*-\s*(remaster(ed)?(\s*\d{4})?|radio\s*edit|single\s*version|"
+    r"album\s*version|deluxe(\s*edition)?|mono|stereo|live|acoustic|"
+    r"bonus\s*track|extended(\s*mix)?|explicit|clean)\s*$",
+    re.IGNORECASE,
+)
+
+
+def clean_query_text(text: str) -> str:
+    """Strip noise that throws off Soulseek's filename search without
+    changing what track *text* actually names."""
+    text = _BRACKETED_RE.sub("", text)
+    text = _NOISE_SUFFIX_RE.sub("", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 class SlskdError(Exception):
@@ -216,3 +247,66 @@ def find_downloaded_file(downloads_dir: str, remote_filename: str, expected_size
                 except OSError:
                     continue
     return None
+
+
+def _relevance_score(remote_path: str, artist: str, title: str) -> int:
+    """Fuzzy-match *remote_path* against (artist, title).
+
+    Both use a partial-ratio style match (best-aligned substring, not a
+    whole-string comparison) since a remote filename is never just the
+    title or artist alone — it's a track number, the title, a quality
+    tag, and often the artist and extension all run together with no
+    separator token-based matching can rely on ("...KarmaPolice.mp3").
+    The artist is checked against the *whole* path rather than just the
+    filename, since peers often nest tracks under an Artist/Album folder
+    instead of naming the file itself "Artist - Title.mp3". Both have to
+    hold up — a great title match on a completely different artist (a
+    cover, a same-named song) shouldn't outrank a real match.
+    """
+    path_lower = remote_path.replace("\\", "/").lower()
+    filename = path_lower.rsplit("/", 1)[-1]
+    artist_score = fuzz.partial_ratio(artist.lower(), path_lower) if artist else 100
+    title_score = fuzz.partial_token_sort_ratio(title.lower(), filename) if title else 100
+    return int(min(artist_score, title_score))
+
+
+def _filter_and_rank(
+    results: list[SoulseekFile], artist: str, title: str, min_score: int,
+) -> list[SoulseekFile]:
+    scored = [
+        (_relevance_score(f.filename, artist, title), f) for f in results
+    ]
+    scored = [pair for pair in scored if pair[0] >= min_score]
+    scored.sort(key=lambda pair: (
+        -pair[0], not pair[1].has_free_slot, pair[1].queue_length, -(pair[1].bitrate or 0),
+    ))
+    return [f for _score, f in scored]
+
+
+def find_best_candidates(
+    client: SlskdClient, artist: str, title: str, min_score: int = _DEFAULT_RELEVANCE_THRESHOLD,
+) -> list[SoulseekFile]:
+    """Search Soulseek for (*artist*, *title*), automatically, without a
+    human in the loop to judge results by eye.
+
+    Soulseek's own search is a loose token match across peers' shared
+    folder names, so one combined "artist title" query routinely comes
+    back empty even when the track is out there under a plain filename —
+    the same reason manually searching by just the title (or just the
+    artist), then filtering the results by eye, tends to work better than
+    one big combined query. This automates that: try the title alone,
+    then the artist alone, then both combined, stopping at the first
+    attempt that yields any candidate above *min_score* — and within
+    each attempt, rank by relevance first so a loosely-matched wrong-song
+    result never outranks a real one on availability/bitrate alone.
+    """
+    title_clean = clean_query_text(title)
+    artist_clean = clean_query_text(artist)
+
+    for query in (title_clean, artist_clean, f"{artist_clean} {title_clean}".strip()):
+        if not query:
+            continue
+        ranked = _filter_and_rank(client.search(query), artist, title, min_score)
+        if ranked:
+            return ranked
+    return []

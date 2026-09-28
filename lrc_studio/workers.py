@@ -18,11 +18,33 @@ import syncedlyrics
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from soulseek import (
-    SlskdClient, SlskdConnectionError, SlskdError, SoulseekFile, find_downloaded_file,
+    SlskdClient, SlskdConnectionError, SlskdError, SoulseekFile,
+    find_best_candidates, find_downloaded_file,
 )
 
 if TYPE_CHECKING:
     from spotify_playlist import SpotifyTrack
+
+
+def stop_thread(thread: QThread | None, timeout_ms: int = 2000) -> None:
+    """Best-effort shutdown of a possibly-running *thread*, for app close.
+
+    Threads with a ``request_cancel`` (the Playlist* threads) get asked
+    to stop cooperatively first. Everything else may be blocked in a
+    network call with no way to interrupt it short-of ``terminate()`` —
+    normally unsafe (it can leave native state mid-update), but harmless
+    here since the whole process is about to exit anyway, and the
+    alternative is Qt's "QThread: Destroyed while thread is still
+    running" crash.
+    """
+    if thread is None or not thread.isRunning():
+        return
+    cancel = getattr(thread, "request_cancel", None)
+    if callable(cancel):
+        cancel()
+    if not thread.wait(timeout_ms):
+        thread.terminate()
+        thread.wait()
 
 
 class LyricsDownloaderThread(QThread):
@@ -323,7 +345,7 @@ class PlaylistSearchThread(QThread):
             self.progress.emit(f"[{i}/{total}] Searching Soulseek: {track.query}")
             self.track_searching.emit(row_index)
             try:
-                results = self._client.search(track.query)
+                results = find_best_candidates(self._client, track.artist, track.title)
                 consecutive_connection_failures = 0
             except SlskdConnectionError as exc:
                 consecutive_connection_failures += 1
