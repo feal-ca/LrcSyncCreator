@@ -8,13 +8,16 @@ for when you want to fine-tune the sync yourself.
 
 ## Features
 
-1. **Download tab**: paste a Spotify track, album, or playlist link and
-   it's fetched, deduped against your library, and every missing track is
-   auto-matched on Soulseek — nothing downloads until you've reviewed the
-   matches (and overridden any you don't like) and click Download.
-2. **Library tab**: the audio player, verse list, and timeline for
-   syncing lyrics by hand — everything a downloaded (or manually added)
-   track needs before it's "done."
+1. **Find Music**: one search box, reached from the library's "+ Add Music"
+   menu — type a song to search Soulseek directly, or paste a Spotify
+   track/album/playlist link to pull its whole tracklist. A pasted link
+   fetches, dedupes against your library, and auto-matches every missing
+   track on Soulseek — nothing downloads until you've reviewed the matches
+   (and overridden any you don't like) and click Download.
+2. **The editor**: the audio player, verse list, and timeline for syncing
+   lyrics by hand — everything a downloaded (or manually added) track
+   needs before it's "done." It's always there in the main workspace,
+   ready as soon as you pick a song from the library.
 3. **Audio Playback**: Load and play `.mp3`/`.flac`/`.wav`/`.ogg`/`.m4a`/`.opus` files via VLC, with a seek bar and PipeWire/PulseAudio output-device selection (Linux).
 4. **Lyric Synchronization**: Sync lyrics with audio by adding, adjusting, and editing timestamps — by keyboard, by dragging blocks on the timeline, or with a global ±ms offset for tracks that drift uniformly.
 5. **Verse Management**: Add, delete, sort, or undo verse edits; fast keyboard-driven line entry (press Enter to jump to the next line).
@@ -64,21 +67,23 @@ In LRC Studio, go to Tools → Settings and fill in slskd's URL (`http://127.0.0
 Run `./run-lrc.sh`, or directly: `python3 lrc_studio/main.py`.
 
 ### Syncing Lyrics
-1. Add audio files via "Add Files" or drag-and-drop.
-2. Use "Web Search" or "Download Lyrics" (batch) to fetch existing synced lyrics, or type your own.
+1. Add audio files via the library's "+ Add Music" → "Add Files," or drag-and-drop.
+2. Use **Get Lyrics** to fetch existing synced lyrics for the loaded song, or type your own. To fetch lyrics for every file missing them at once, use the library panel's overflow (**⋮**) menu → "Fetch Lyrics for All Missing."
 3. Play the track and press **S** to stamp each line as it starts, or drag verse blocks directly on the timeline to fine-tune.
 
 ### Finding & Downloading Music
 
-**Download tab** is the main way to get music in:
-1. Paste a Spotify track, album, or playlist link and click **Fetch**. Every track is fuzzy-matched (artist + title) against your library folder first — tracks you already have are marked "In Library" immediately. Spotify's public embed page (no login needed) caps album/playlist links at their first 50 tracks; longer ones are clearly flagged as truncated rather than silently dropping the rest.
+**Find Music** (library "+ Add Music" menu, or Tools → Find Music, Ctrl+F) is the main way to get music in. It's one search box: type a song to search Soulseek directly, or paste a Spotify track/album/playlist link to pull its whole tracklist — the app figures out which from what you enter.
+
+Pasting a link opens the review workspace, next to your library rather than replacing it:
+1. Every track is fuzzy-matched (artist + title) against your library folder first — tracks you already have are marked "In Library" immediately. Spotify's public embed page (no login needed) caps album/playlist links at their first 50 tracks; longer ones are clearly flagged as truncated rather than silently dropping the rest.
 2. Everything missing gets auto-searched on Soulseek right away and the table fills in with each track's best match (quality, size, upload-slot status) — but **nothing downloads yet**.
 3. Review the **Match** column. Don't like a pick (wrong version, low bitrate, no free slot)? Click **Change Match** on that row to see every candidate and pick a different one, or re-run the search with an edited query.
 4. Click **Download All Missing** (or a single row's **Download**) to actually fetch whatever's currently selected per row. Live per-row status, an overall progress bar, and a **Cancel** button for the whole batch.
-5. Finished downloads get lyrics fetched automatically and show up in the Library tab's file list. Double-click a "Downloaded" row to jump straight to the Library tab with that song loaded and ready to sync.
+5. Finished downloads get lyrics fetched automatically and appear in the library immediately as each one lands — no need to switch views to see it happened. Once a batch finishes, the editor opens on the first newly-downloaded song, ready to sync.
 6. Rows that failed get a **Retry Search** or **Retry** (download) action, whichever applies.
 
-**Library tab → Find on Soulseek**: for a one-off track outside any playlist — search by artist/title, pick a result, and it downloads straight into your library folder and auto-fetches lyrics.
+Typing a plain search instead of pasting a link is for a one-off track outside any playlist: pick a result, and it downloads straight into your library folder and auto-fetches lyrics.
 
 ### Validate Sync
 Tools → Validate Sync samples up to 5 lines spread across the song, extracts a short clip around each one's timestamp, and transcribes it locally with faster-whisper. Each sampled line is checked two ways:
@@ -90,17 +95,24 @@ This is a spot-check, not an audit — it won't catch problems in lines it doesn
 ---
 
 ## User Interface
-Two tabs: **Download** (Spotify link, track table, matches, progress) and
-**Library** (shown below), which is where you land once a track's
-downloaded and it's time to sync its lyrics:
+One window, not separate screens for browsing your library and finding new
+music — a persistent **library panel** on the left, and a **workspace** on
+the right that shows whichever of three things is relevant:
 
 ![Screenshot of the working program](Exampleuse1.png)
 
-- The top section features the play/pause button along with details about the currently playing track.
-- Below that, there is an interactive playback bar.
-- The bottom left section displays all the verses.
-- Each verse includes a timestamp, the lyrics, and three buttons: "sync," "delete," and "add."
-- On the right side, there are buttons for adding lyrics, saving the file, opening an MP3, and more.
+- **Library panel** (always visible): your song list, color-coded by sync
+  status; a "+ Add Music" menu (Add Files, Find Music); and an overflow
+  (**⋮**) menu for the occasional stuff — Standardize Names, Clear
+  Completed, Fetch Lyrics for All Missing.
+- **The editor**, once you pick a song: playback controls and the karaoke
+  display up top, the timeline below that, then the verse list and its
+  action row (Save, Get Lyrics, Sort Lines, Shift All, Clear All).
+- **The review table**, while a Spotify link is being imported: track,
+  status, and match columns, reviewed and downloaded without ever leaving
+  the library behind.
+- **An empty state**, when nothing's loaded yet, inviting you to select a
+  song or add music rather than showing a blank editor shell.
 
 ---
 
