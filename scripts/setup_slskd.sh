@@ -74,4 +74,5 @@ else
 fi
 
 echo
-echo "Setup complete. Start it with: ./scripts/run_slskd.sh"
+echo "Setup complete. LRC Studio will start slskd itself the next time it"
+echo "needs it — or start it manually with: ./scripts/run_slskd.sh"

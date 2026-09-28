@@ -1,17 +1,18 @@
-"""spotify_playlist.py — read a public Spotify playlist's track list from a
-pasted link, with no developer account or API credentials.
+"""spotify_playlist.py — read a public Spotify track/album/playlist's track
+list from a pasted link, with no developer account or API credentials.
 
 Works by parsing the ``__NEXT_DATA__`` JSON Spotify embeds in its own
-no-auth embed page (``open.spotify.com/embed/playlist/<id>``) — confirmed
-live against a real public playlist during development.
+no-auth embed pages (``open.spotify.com/embed/<kind>/<id>`` for
+``kind`` in track/album/playlist) — confirmed live against real public
+links during development.
 
-Known limitation: that embed page caps out at the playlist's first 50
+Known limitation: the album/playlist embed page caps out at the first 50
 tracks and its ``?offset=`` query param has no effect (verified — it just
 returns the same first 50 again). There's no unauthenticated way around
-that; longer playlists come back truncated, with ``truncated=True`` so
-callers can warn rather than silently drop tracks. A future upgrade path
-is the official Spotify Web API (needs a free developer app), which isn't
-wired up here since the point of this module is not needing one.
+that; longer albums/playlists come back truncated, with ``truncated=True``
+so callers can warn rather than silently drop tracks. A future upgrade
+path is the official Spotify Web API (needs a free developer app), which
+isn't wired up here since the point of this module is not needing one.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import mutagen
 import requests
 from rapidfuzz import fuzz
 
-_ID_RE = re.compile(r"playlist[:/]([a-zA-Z0-9]{22})")
+_LINK_RE = re.compile(r"(track|album|playlist)[:/]([a-zA-Z0-9]{22})")
 _NEXT_DATA_RE = re.compile(
     r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', re.DOTALL
 )
@@ -33,8 +34,8 @@ _EMBED_TRACK_LIMIT = 50
 _DEFAULT_MATCH_THRESHOLD = 80  # rapidfuzz token_sort_ratio, 0-100
 
 
-class SpotifyPlaylistError(Exception):
-    """Raised when a playlist link can't be parsed or fetched."""
+class SpotifyLinkError(Exception):
+    """Raised when a Spotify link can't be parsed or fetched."""
 
 
 @dataclass(frozen=True)
@@ -50,23 +51,29 @@ class SpotifyTrack:
         return self.query
 
 
-def extract_playlist_id(link_or_uri: str) -> str:
-    """Pull a 22-char playlist ID out of a pasted link, URI, or bare ID."""
+def extract_spotify_ref(link_or_uri: str) -> tuple[str, str]:
+    """Pull ``(kind, id)`` out of a pasted track/album/playlist link, URI,
+    or bare ID (bare IDs are assumed to be a playlist, for backwards
+    compatibility with links that omit the type)."""
     text = link_or_uri.strip()
-    match = _ID_RE.search(text)
+    match = _LINK_RE.search(text)
     if match:
-        return match.group(1)
+        return match.group(1), match.group(2)
     if re.fullmatch(r"[a-zA-Z0-9]{22}", text):
-        return text
-    raise SpotifyPlaylistError(f"Couldn't find a playlist ID in: {link_or_uri!r}")
+        return "playlist", text
+    raise SpotifyLinkError(
+        f"Couldn't find a Spotify track/album/playlist link in: {link_or_uri!r}"
+    )
 
 
-def fetch_playlist_tracks(
+def fetch_spotify_tracks(
     link_or_uri: str, timeout_s: float = 15.0,
 ) -> tuple[list[SpotifyTrack], bool]:
-    """Return ``(tracks, truncated)`` for the playlist at *link_or_uri*."""
-    playlist_id = extract_playlist_id(link_or_uri)
-    url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+    """Return ``(tracks, truncated)`` for the track/album/playlist at
+    *link_or_uri*. ``tracks`` has one entry for a track link, or the full
+    list of tracks for an album/playlist link."""
+    kind, spotify_id = extract_spotify_ref(link_or_uri)
+    url = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
     try:
         resp = requests.get(
             url, timeout=timeout_s,
@@ -74,27 +81,36 @@ def fetch_playlist_tracks(
         )
         resp.raise_for_status()
     except requests.RequestException as exc:
-        raise SpotifyPlaylistError(f"Couldn't reach Spotify: {exc}") from exc
+        raise SpotifyLinkError(f"Couldn't reach Spotify: {exc}") from exc
 
     match = _NEXT_DATA_RE.search(resp.text)
     if not match:
-        raise SpotifyPlaylistError(
+        raise SpotifyLinkError(
             "Couldn't parse Spotify's page — it may have changed, or the "
-            "playlist link is private/invalid."
+            "link is private/invalid."
         )
     try:
         data = json.loads(match.group(1))
         entity = data["props"]["pageProps"]["state"]["data"]["entity"]
-        raw_tracks = entity["trackList"]
     except (KeyError, json.JSONDecodeError) as exc:
-        raise SpotifyPlaylistError(f"Unexpected page structure: {exc}") from exc
+        raise SpotifyLinkError(f"Unexpected page structure: {exc}") from exc
 
-    tracks = [
-        SpotifyTrack(artist=t.get("subtitle", "").strip(), title=t.get("title", "").strip())
-        for t in raw_tracks
-        if t.get("title")
-    ]
-    truncated = len(raw_tracks) >= _EMBED_TRACK_LIMIT
+    raw_tracks = entity.get("trackList")
+    if raw_tracks is not None:
+        # Album/playlist embed: a list of tracks.
+        tracks = [
+            SpotifyTrack(artist=t.get("subtitle", "").strip(), title=t.get("title", "").strip())
+            for t in raw_tracks
+            if t.get("title")
+        ]
+        truncated = len(raw_tracks) >= _EMBED_TRACK_LIMIT
+    else:
+        # Track embed: the entity itself is the one track.
+        title = entity.get("title", "").strip()
+        if not title:
+            raise SpotifyLinkError(f"Unexpected page structure for {kind} embed")
+        tracks = [SpotifyTrack(artist=entity.get("subtitle", "").strip(), title=title)]
+        truncated = False
     return tracks, truncated
 
 

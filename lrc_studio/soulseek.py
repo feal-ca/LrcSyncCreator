@@ -1,8 +1,9 @@
 """soulseek.py — thin REST client for slskd (https://github.com/slskd/slskd).
 
 LRC Studio never speaks the Soulseek protocol itself; slskd owns the P2P
-connection and exposes a small REST API that this module wraps. Run it via
-``scripts/setup_slskd.sh`` then ``scripts/run_slskd.sh``.
+connection and exposes a small REST API that this module wraps. Install it
+once via ``scripts/setup_slskd.sh`` — after that, ``app.py`` starts it
+itself (via ``scripts/run_slskd.sh``) the first time it's needed.
 
 Endpoint shapes here were confirmed against a live slskd 0.26.0 instance
 (search + response schema); the download-completion path is intentionally
@@ -24,6 +25,16 @@ AUDIO_EXTENSIONS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus")
 
 class SlskdError(Exception):
     """Raised for any slskd connectivity/API failure."""
+
+
+class SlskdConnectionError(SlskdError):
+    """slskd is unreachable (not running, wrong URL, network down).
+
+    Distinguished from other SlskdErrors so callers looping over many
+    tracks can fail fast instead of repeating the same doomed request
+    once per track — see the circuit-breakers in PlaylistSearchThread
+    and PlaylistDownloadThread.
+    """
 
 
 @dataclass
@@ -66,6 +77,17 @@ class SlskdClient:
             )
             resp.raise_for_status()
             return resp
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            # Short, classified message — the underlying urllib3 exception
+            # text can run to hundreds of characters and is useless noise
+            # repeated once per track in a batch import.
+            raise SlskdConnectionError(
+                f"Can't reach slskd at {self.base_url} — is it running? "
+                "(Tools -> Settings -> Test Connection)"
+            ) from exc
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            raise SlskdError(f"slskd returned HTTP {status} for {method} {path}") from exc
         except requests.RequestException as exc:
             raise SlskdError(f"slskd request failed ({method} {path}): {exc}") from exc
 
@@ -90,24 +112,44 @@ class SlskdClient:
         Returns audio-file candidates across all responding peers, best
         candidates first (free upload slot, short queue, higher bitrate).
 
-        slskd's own internal search timeout is ~15s and — confirmed against
-        a live instance — its ``/responses`` endpoint stays empty until the
-        search is actually marked complete, even though the search summary
-        reports a nonzero response count well before then. ``wait_s``
-        defaults comfortably past that so results aren't dropped by racing
-        slskd's own timeout.
+        Confirmed against a live instance: real searches routinely stay
+        ``isComplete: false`` for 40-90s+ (peers keep trickling in), well
+        past slskd's own advertised ~15s internal timeout — and its
+        ``/responses`` endpoint stays completely empty until the search is
+        actually marked complete, even though the search summary reports a
+        nonzero response count well before then. Waiting out the full
+        natural completion would make every track in a playlist import take
+        up to a minute, so instead: if *wait_s* elapses first, explicitly
+        stop the search (``PUT .../searches/{id}``) — slskd marks it
+        ``Completed, Cancelled`` immediately and ``/responses`` then returns
+        whatever was collected so far, which in practice is the vast
+        majority of the peers that were ever going to answer.
         """
         resp = self._request("POST", "/api/v0/searches", json={"searchText": query})
         search_id = resp.json()["id"]
 
         deadline = time.monotonic() + wait_s
+        is_complete = False
         while time.monotonic() < deadline:
             state = self._request("GET", f"/api/v0/searches/{search_id}").json()
             if state.get("isComplete"):
+                is_complete = True
                 break
             time.sleep(poll_interval_s)
 
-        responses = self._request("GET", f"/api/v0/searches/{search_id}/responses").json()
+        if not is_complete:
+            self._request("PUT", f"/api/v0/searches/{search_id}")
+
+        # /responses lags slightly behind isComplete flipping true (whether
+        # that happened naturally or via the stop above) — confirmed against
+        # a live instance: reading it in the same instant can still race and
+        # come back empty. A few short retries clear that up reliably.
+        responses = []
+        for _ in range(5):
+            responses = self._request("GET", f"/api/v0/searches/{search_id}/responses").json()
+            if responses:
+                break
+            time.sleep(0.5)
 
         results: list[SoulseekFile] = []
         for r in responses:

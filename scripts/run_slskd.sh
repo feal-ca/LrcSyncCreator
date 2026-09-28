@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Runs slskd in the foreground using the config written by setup_slskd.sh.
-# LRC Studio's Soulseek features (Find on Soulseek, Spotify playlist import)
-# need this running first.
+# LRC Studio launches this itself when a Soulseek feature (Find on Soulseek,
+# Spotify import) needs it and it isn't already running — run it by hand
+# only if you want to watch its logs directly.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
