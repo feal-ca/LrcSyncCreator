@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSplitter, QTabWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from constants import (
@@ -92,6 +92,12 @@ class _Command:
     menu: str | None                  # "file" | "edit" | "tools" | "help" | None
     help_text: str | None = None      # Help-dialog phrasing; defaults to *label*
     separator_before: bool = False    # start a new group within its menu
+
+
+# Pages of the main window's workspace stack (see LrcSyncApp._init_ui).
+WORKSPACE_EDITOR = 0
+WORKSPACE_ACQUIRE = 1
+WORKSPACE_EMPTY = 2
 
 
 class LrcSyncApp(QMainWindow):
@@ -282,24 +288,13 @@ class LrcSyncApp(QMainWindow):
         self._commands = self._build_commands()
         self._build_menu_bar()
 
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
-        self.tabs.addTab(self._build_library_tab(), "Library")
+        central = QWidget()
+        self.setCentralWidget(central)
+        root_layout = QVBoxLayout(central)
+        root_layout.setContentsMargins(15, 15, 15, 15)
+        root_layout.setSpacing(10)
 
-        self.download_view = DownloadView(
-            self.settings, self._get_slskd_client, self._collect_library_paths, self,
-        )
-        self.download_view.files_ready.connect(self._on_download_files_ready)
-        self.download_view.open_in_library.connect(self._open_in_library)
-        self.tabs.addTab(self.download_view, "Download")
-
-    def _build_library_tab(self) -> QWidget:
-        root = QWidget()
-        main = QVBoxLayout(root)
-        main.setContentsMargins(15, 15, 15, 15)
-        main.setSpacing(10)
-
-        main.addLayout(self._build_top_bar())
+        root_layout.addLayout(self._build_top_bar())
 
         # ── Karaoke display ───────────────────────────────────────────
         self.karaoke_label = QLabel("Waiting for song…")
@@ -310,26 +305,43 @@ class LrcSyncApp(QMainWindow):
             " border-radius: 10px; border: 1px solid #313244;"
         )
         self.karaoke_label.setFixedHeight(80)
-        main.addWidget(self.karaoke_label)
+        root_layout.addWidget(self.karaoke_label)
 
         # ── Timeline ──────────────────────────────────────────────────
         self.timeline = TimelineWidget()
         self.timeline.setMouseTracking(True)
         self.timeline.time_changed_bulk.connect(self._update_verses_from_timeline)
         self.timeline.seek_requested.connect(self.set_position)
-        main.addWidget(self.timeline)
+        root_layout.addWidget(self.timeline)
 
-        # ── Splitter: file list | lyrics editor ───────────────────────
+        # ── Splitter: library panel | workspace ─────────────────────────
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
         self.library_panel = LibraryPanel(self.settings)
         self.library_panel.song_selected.connect(self._on_library_song_selected)
         self.library_panel.file_renamed.connect(self._on_file_renamed)
         self.library_panel.find_music_requested.connect(self._find_music)
+        self.library_panel.fetch_missing_lyrics_requested.connect(
+            lambda paths: self._batch_download_lyrics()
+        )
         self.splitter.addWidget(self.library_panel)
-        self.splitter.addWidget(self._build_lyrics_panel())
+
+        self.workspace = QStackedWidget()
+        self.workspace.addWidget(self._build_lyrics_panel())      # WORKSPACE_EDITOR = 0
+
+        self.download_view = DownloadView(
+            self.settings, self._get_slskd_client, self._collect_library_paths, self,
+        )
+        self.download_view.files_ready.connect(self._on_download_files_ready)
+        self.download_view.file_downloaded.connect(self.library_panel.add_files_single)
+        self.download_view.open_in_library.connect(self._open_in_library)
+        self.workspace.addWidget(self.download_view)               # WORKSPACE_ACQUIRE = 1
+
+        self.workspace.addWidget(self._build_empty_state())         # WORKSPACE_EMPTY = 2
+
+        self.splitter.addWidget(self.workspace)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 3)
-        main.addWidget(self.splitter, stretch=1)
+        root_layout.addWidget(self.splitter, stretch=1)
 
         # ── Status bar ────────────────────────────────────────────────
         self.status_bar = QLabel("Ready")
@@ -346,16 +358,35 @@ class LrcSyncApp(QMainWindow):
         stat_row = QHBoxLayout()
         stat_row.addWidget(self.status_bar)
         stat_row.addWidget(self.progress_bar)
-        main.addLayout(stat_row)
+        root_layout.addLayout(stat_row)
 
-        return root
+        self.workspace.setCurrentIndex(WORKSPACE_EMPTY)
+
+    def _build_empty_state(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        label = QLabel("Select a song from your library, or add music to get started.")
+        label.setStyleSheet(f"color: {COLOR_MUTED.name()}; font-size: 14px;")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(label)
+
+        self._empty_state_add_music_button = QPushButton("+ Add Music")
+        self._empty_state_add_music_button.clicked.connect(self.library_panel.find_music_requested.emit)
+        self._empty_state_add_music_button.setStyleSheet(self._primary_button_style())
+        layout.addWidget(self._empty_state_add_music_button, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        return page
 
     def _on_download_files_ready(self, paths: list[str]) -> None:
-        self._process_added_files(paths)
+        self.library_panel.add_files(paths)
         self._fetch_lyrics_for(paths)
+        if paths:
+            self._load_song(paths[0])
+            self.library_panel.select_path(paths[0])
 
     def _open_in_library(self, path: str) -> None:
-        self.tabs.setCurrentWidget(self.tabs.widget(0))
         if not self._confirm_discard_if_dirty():
             return
         self._load_song(path)
@@ -1286,7 +1317,8 @@ class LrcSyncApp(QMainWindow):
             self._start_soulseek_download(client, dialog.selected_file, auto_fetch_lyrics=True)
 
     def _open_batch_import(self, link: str) -> None:
-        raise NotImplementedError  # implemented in Task 6
+        self.workspace.setCurrentIndex(WORKSPACE_ACQUIRE)
+        self.download_view.start_fetch(link)
 
     def _start_soulseek_download(
         self, client: SlskdClient, file: SoulseekFile, auto_fetch_lyrics: bool,
@@ -1415,9 +1447,6 @@ class LrcSyncApp(QMainWindow):
         splitter_state = self.settings.value("splitter_state")
         if splitter_state is not None:
             self.splitter.restoreState(splitter_state)
-        last_tab = self.settings.value("last_tab", 0, type=int)
-        if 0 <= last_tab < self.tabs.count():
-            self.tabs.setCurrentIndex(last_tab)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         if not self._confirm_discard_if_dirty():
@@ -1425,7 +1454,6 @@ class LrcSyncApp(QMainWindow):
             return
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
-        self.settings.setValue("last_tab", self.tabs.currentIndex())
 
         # Stop any in-flight background work before the window (and the
         # QThread objects with it) goes away — otherwise Qt either warns
@@ -1475,6 +1503,7 @@ class LrcSyncApp(QMainWindow):
         self.player.set_media(self._vlc.media_new(path))
         self.song_is_loaded = True
         self.play_pause_btn.setText("▶")
+        self.workspace.setCurrentIndex(WORKSPACE_EDITOR)
 
         lrc_path = os.path.splitext(path)[0] + ".lrc"
         color    = analyze_lrc_status(lrc_path)

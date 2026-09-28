@@ -165,6 +165,9 @@ class LibraryPanel(QWidget):
                 existing.add(path)
         self._refresh_placeholder()
 
+    def add_files_single(self, path: str) -> None:
+        self.add_files([path])
+
     def open_add_files_dialog(self) -> None:
         last_dir = self._settings.value("last_dir", "")
         files, _ = QFileDialog.getOpenFileNames(
