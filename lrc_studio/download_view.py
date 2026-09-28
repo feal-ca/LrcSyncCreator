@@ -158,8 +158,8 @@ class DownloadView(QWidget):
         self.table.setShowGrid(False)
         self.table.setStyleSheet(
             f"QTableWidget {{ background-color: {COLOR_TIMELINE_BG.name()};"
-            " border: 1px solid #45475a; border-radius: 4px; }"
-            "QHeaderView::section { background-color: #313244; color: white;"
+            " border: 1px solid #45475a; font-size: 13px; border-radius: 4px; }"
+            f"QHeaderView::section {{ background-color: #313244; color: {COLOR_FG.name()};"
             " border: none; padding: 4px; }"
         )
         header = self.table.horizontalHeader()
