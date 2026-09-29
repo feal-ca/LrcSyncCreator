@@ -57,6 +57,10 @@ def clean_query_text(text: str) -> str:
 class SlskdError(Exception):
     """Raised for any slskd connectivity/API failure."""
 
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class SlskdConnectionError(SlskdError):
     """slskd is unreachable (not running, wrong URL, network down).
@@ -117,8 +121,19 @@ class SlskdClient:
                 "(Tools -> Settings -> Test Connection)"
             ) from exc
         except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else "?"
-            raise SlskdError(f"slskd returned HTTP {status} for {method} {path}") from exc
+            status = exc.response.status_code if exc.response is not None else None
+            detail = ""
+            if exc.response is not None:
+                try:
+                    detail = exc.response.text.strip()
+                except Exception:
+                    detail = ""
+            suffix = f": {detail}" if detail else ""
+            raise SlskdError(
+                f"slskd returned HTTP {status if status is not None else '?'} "
+                f"for {method} {path}{suffix}",
+                status_code=status,
+            ) from exc
         except requests.RequestException as exc:
             raise SlskdError(f"slskd request failed ({method} {path}): {exc}") from exc
 
@@ -134,6 +149,30 @@ class SlskdClient:
         if server.get("isConnecting") or server.get("isLoggingIn"):
             return False, "slskd is still connecting to Soulseek — try again shortly."
         return False, "slskd is running but not logged in to Soulseek (check its credentials)."
+
+    def _post_search(self, query: str):
+        """POST a new search, retrying once on a transient 409.
+
+        slskd returns 409 for ``POST /api/v0/searches`` when its own
+        connection to the Soulseek server isn't in a connected+logged-in
+        state at that instant (see ``SearchesController.Post`` /
+        ``SoulseekClient.SearchAsync`` upstream) — including a connection
+        that was fine moments ago and is mid-reconnect right now. slskd
+        reconnects on its own, so poll ``check_connection`` briefly and
+        retry once rather than failing the whole search outright.
+        """
+        try:
+            return self._request("POST", "/api/v0/searches", json={"searchText": query})
+        except SlskdError as exc:
+            if exc.status_code != 409:
+                raise
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                ok, _ = self.check_connection()
+                if ok:
+                    break
+                time.sleep(1.0)
+            return self._request("POST", "/api/v0/searches", json={"searchText": query})
 
     def search(
         self, query: str, wait_s: float = 20.0, poll_interval_s: float = 1.0,
@@ -156,7 +195,7 @@ class SlskdClient:
         whatever was collected so far, which in practice is the vast
         majority of the peers that were ever going to answer.
         """
-        resp = self._request("POST", "/api/v0/searches", json={"searchText": query})
+        resp = self._post_search(query)
         search_id = resp.json()["id"]
 
         deadline = time.monotonic() + wait_s

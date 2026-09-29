@@ -1,9 +1,14 @@
 """Tests for lrc_studio/soulseek.py's query-cleanup and result-relevance
 helpers (find_best_candidates and friends) — no network involved; the
 SlskdClient is a stub whose .search() returns canned results per query.
+
+The SlskdClient._request/.search tests below do exercise the real HTTP
+client, against a fake requests.request rather than a live slskd.
 """
 
-from soulseek import SoulseekFile, clean_query_text, find_best_candidates
+import requests
+
+from soulseek import SlskdClient, SlskdError, SoulseekFile, clean_query_text, find_best_candidates
 
 
 def _file(filename: str, bitrate: int = 320, free_slot: bool = True) -> SoulseekFile:
@@ -112,3 +117,87 @@ def test_find_best_candidates_ranks_relevance_over_bitrate():
 def test_find_best_candidates_returns_empty_when_nothing_matches():
     client = _FakeClient({})
     assert find_best_candidates(client, "Nobody", "Nothing") == []
+
+
+# ---------------------------------------------------------------------------
+# SlskdClient._request / .search — against a fake requests.request, not a
+# live slskd. Covers the 409 ("not connected and logged in to Soulseek")
+# that slskd's SearchesController returns when its own connection to the
+# Soulseek server drops right as a search is posted.
+# ---------------------------------------------------------------------------
+
+class _FakeResponse:
+    def __init__(self, status_code: int, json_data=None, text: str = "") -> None:
+        self.status_code = status_code
+        self._json_data = json_data
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(response=self)
+
+    def json(self):
+        return self._json_data
+
+
+def test_request_error_message_includes_slskd_response_body(monkeypatch):
+    body = "The server connection must be connected and logged in to perform a search (currently: Disconnected)"
+    monkeypatch.setattr("soulseek.requests.request", lambda *a, **k: _FakeResponse(409, text=body))
+
+    client = SlskdClient("http://localhost:5030", "key")
+    try:
+        client._request("POST", "/api/v0/searches", json={"searchText": "x"})
+        raised = None
+    except SlskdError as exc:
+        raised = exc
+
+    assert raised is not None
+    assert "connected and logged in" in str(raised)
+
+
+def test_search_retries_once_after_transient_409_and_succeeds(monkeypatch):
+    calls = {"post": 0}
+
+    def fake_request(method, url, headers=None, timeout=None, **kwargs):
+        if method == "POST" and url.endswith("/api/v0/searches"):
+            calls["post"] += 1
+            if calls["post"] == 1:
+                return _FakeResponse(409, text="not connected and logged in")
+            return _FakeResponse(200, json_data={"id": "search-1"})
+        if method == "GET" and url.endswith("/api/v0/application"):
+            return _FakeResponse(200, json_data={"server": {"isLoggedIn": True}})
+        if method == "GET" and url.endswith("/api/v0/searches/search-1"):
+            return _FakeResponse(200, json_data={"isComplete": True})
+        if method == "GET" and url.endswith("/api/v0/searches/search-1/responses"):
+            return _FakeResponse(200, json_data=[])
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    monkeypatch.setattr("soulseek.requests.request", fake_request)
+
+    client = SlskdClient("http://localhost:5030", "key")
+    results = client.search("some query")
+
+    assert results == []
+    assert calls["post"] == 2  # first attempt 409'd, retry succeeded
+
+
+def test_search_does_not_retry_on_non_409_errors(monkeypatch):
+    calls = {"post": 0}
+
+    def fake_request(method, url, headers=None, timeout=None, **kwargs):
+        if method == "POST" and url.endswith("/api/v0/searches"):
+            calls["post"] += 1
+            return _FakeResponse(500, text="boom")
+        raise AssertionError(f"unexpected request {method} {url}")
+
+    monkeypatch.setattr("soulseek.requests.request", fake_request)
+
+    client = SlskdClient("http://localhost:5030", "key")
+    try:
+        client.search("some query")
+        raised = True
+    except SlskdError:
+        raised = False
+
+    assert raised is False
+    assert calls["post"] == 1  # no retry for a non-409 failure
