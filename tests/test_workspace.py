@@ -64,6 +64,11 @@ def window(qapp, monkeypatch, tmp_path):
 
     win = LrcSyncApp()
     yield win
+    # A dirty window (e.g. from a test verifying the C1 fix below) makes
+    # win.close() trigger a real, unmocked QMessageBox.question via
+    # _confirm_discard_if_dirty — see test_app_commands.py's window
+    # fixture for the full root-cause writeup of this exact hang.
+    win._dirty = False
     win.close()
 
 
@@ -91,36 +96,111 @@ def test_open_batch_import_swaps_to_the_acquire_page(window):
     assert window.workspace.currentIndex() == WORKSPACE_ACQUIRE
 
 
+def test_open_batch_import_does_not_refetch_while_a_batch_is_active(window, monkeypatch):
+    # Review finding I1: re-entering Find Music with a batch already in
+    # flight used to unconditionally call start_fetch again, which wipes
+    # the table/rows (table.setRowCount(0); self._rows = []) while a
+    # still-running search/download thread keeps delivering results by
+    # row index into a list that no longer has those rows — IndexError,
+    # which PyQt turns into a fatal abort rather than a catchable
+    # exception. Re-entering must just show the in-progress batch.
+    calls = []
+    monkeypatch.setattr(window.download_view, "start_fetch", lambda link: calls.append(link))
+
+    class _RunningThread:
+        # wait() is required alongside isRunning(): this fake outlives
+        # the test body (still attached to download_view at teardown),
+        # and DownloadView.shutdown() -> stop_thread() calls wait() right
+        # after isRunning() returns True — the same class of gap as
+        # elsewhere in this file's _FakeFetchThread, just one method
+        # further into stop_thread's body.
+        def isRunning(self) -> bool: return True
+        def wait(self, timeout_ms: int) -> bool: return True
+
+    window.download_view._download_thread = _RunningThread()
+
+    window._open_batch_import("https://open.spotify.com/playlist/abc")
+
+    assert calls == []
+    assert window.workspace.currentIndex() == WORKSPACE_ACQUIRE
+
+
+def test_open_batch_import_fetches_normally_when_nothing_is_active(window, monkeypatch):
+    calls = []
+    monkeypatch.setattr(window.download_view, "start_fetch", lambda link: calls.append(link))
+
+    window._open_batch_import("https://open.spotify.com/playlist/abc")
+
+    assert calls == ["https://open.spotify.com/playlist/abc"]
+
+
 def test_download_view_instance_survives_workspace_swaps(window, tmp_path):
-    # A batch import must not be rebuilt (and its threads lost) just
-    # because the workspace swaps away and back.
+    # A batch import must not be rebuilt (and its threads/rows lost) just
+    # because the workspace swaps away and back. Checking object identity
+    # alone doesn't prove this — nothing in the app ever reassigns
+    # window.download_view, so that assertion would pass even if a swap
+    # silently discarded in-progress state. Populate real in-progress
+    # state (rows + a running thread) and confirm it's still there.
     view_before = window.download_view
     window._open_batch_import("https://open.spotify.com/playlist/abc")
+
+    view_before._rows = ["fake row standing in for an in-progress track"]
+
+    class _RunningThread:
+        def isRunning(self) -> bool: return True
+        def wait(self, timeout_ms: int) -> bool: return True
+
+    view_before._download_thread = _RunningThread()
 
     f = tmp_path / "song.mp3"
     f.write_bytes(b"")
     window.library_panel.add_files([str(f)])
     window.library_panel.song_selected.emit(str(f))   # swap to editor
+    assert window.workspace.currentIndex() == WORKSPACE_EDITOR
+    # The download thread is still "running" (is_batch_active() is True),
+    # so per the I1 fix this must show the batch again, not restart it.
     window._open_batch_import("https://open.spotify.com/playlist/abc")  # swap back
 
     assert window.download_view is view_before
+    assert window.workspace.currentIndex() == WORKSPACE_ACQUIRE
+    assert view_before._rows == ["fake row standing in for an in-progress track"]
+    assert view_before._download_thread.isRunning() is True
+
+    # Let teardown's stop_thread() proceed cleanly against the real
+    # PlaylistDownloadThread machinery rather than this fake.
+    view_before._download_thread = None
 
 
-def test_empty_state_add_music_button_reaches_the_same_signal_as_the_sidebar(window, monkeypatch):
+def test_empty_state_add_music_button_shares_the_sidebars_menu(window):
+    # Review finding I3: the empty state's button used to connect
+    # directly to find_music_requested, so a zero-state user with local
+    # files (the common case) had no way to reach "Add Files" from it —
+    # only the sidebar's own button offered both options. Sharing the
+    # exact same QMenu object (not a second, hand-built equivalent)
+    # guarantees the two can never drift apart again.
+    assert window._empty_state_add_music_button.menu() is window.library_panel.add_music_button.menu()
+
+
+def test_empty_state_add_music_menu_find_music_action_emits_signal(window, monkeypatch):
     from PyQt6.QtWidgets import QDialog
 
-    # find_music_requested is also connected to the real _find_music
-    # (wired in this same task), which opens a real modal
-    # SoulseekSearchDialog.exec() — blocking unless neutralized, same as
-    # test_app_commands.py's Find Music test.
+    # find_music_requested is also connected to the real _find_music,
+    # which opens a real modal SoulseekSearchDialog.exec() — blocking
+    # unless neutralized, same as test_app_commands.py's Find Music test.
     monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
 
     received = []
     window.library_panel.find_music_requested.connect(lambda: received.append(True))
 
-    window._empty_state_add_music_button.click()
+    window._empty_state_add_music_button.menu().actions()[1].trigger()
 
     assert received == [True]
+
+
+def test_empty_state_add_music_menu_add_files_action_is_reachable(window):
+    # Not "not find_music_requested" — actually the same action the
+    # sidebar's "Add Files" runs, proving parity rather than assuming it.
+    assert window._empty_state_add_music_button.menu().actions()[0].text() == "Add Files"
 
 
 def test_file_downloaded_adds_to_library_panel_live(window, tmp_path):
@@ -130,3 +210,62 @@ def test_file_downloaded_adds_to_library_panel_live(window, tmp_path):
     window.download_view.file_downloaded.emit(str(f))
 
     assert str(f) in window.library_panel.real_file_paths()
+
+
+# ---------------------------------------------------------------------------
+# Review finding C1: a finishing batch must not discard unsaved work
+# ---------------------------------------------------------------------------
+
+class _FakeLyricsDownloaderThread:
+    """Stands in for workers.LyricsDownloaderThread so
+    _on_download_files_ready's call to _fetch_lyrics_for doesn't start a
+    real network-hitting thread. isRunning() is required for the same
+    reason documented on _FakeFetchThread above."""
+    progress = type("Signal", (), {"connect": lambda self, fn: None})()
+    finished_batch = type("Signal", (), {"connect": lambda self, fn: None})()
+
+    def __init__(self, *a, **k) -> None: ...
+    def start(self) -> None: ...
+    def isRunning(self) -> bool: return False
+
+
+def test_on_download_files_ready_does_not_switch_songs_while_dirty(window, monkeypatch, tmp_path):
+    # _on_download_files_ready used to call _load_song(paths[0])
+    # unconditionally once a batch completed — if the user had unsaved
+    # sync edits on whatever song was currently loaded, a batch finishing
+    # in the background would silently discard them with no prompt.
+    monkeypatch.setattr(app_module, "LyricsDownloaderThread", _FakeLyricsDownloaderThread)
+
+    current = tmp_path / "current.mp3"
+    current.write_bytes(b"")
+    window._load_song(str(current))
+    window._add_verse("[00:01.00]", "unsaved edit")
+    window._dirty = True
+
+    new_song = tmp_path / "new_from_batch.mp3"
+    new_song.write_bytes(b"")
+
+    window._on_download_files_ready([str(new_song)])
+
+    assert window.current_file_path == str(current)
+    assert window._dirty is True
+    # _load_song(current) itself added one default empty verse (no .lrc
+    # file yet) before the test's own _add_verse call appended a second —
+    # the fix under test is that neither gets wiped by the batch finishing.
+    assert "unsaved edit" in [v.get_verse_text() for v in window._verses]
+    # The new file is still added to the library even though we didn't
+    # jump to it — nothing about the download itself is lost.
+    assert str(new_song) in window.library_panel.real_file_paths()
+
+
+def test_on_download_files_ready_switches_songs_when_not_dirty(window, monkeypatch, tmp_path):
+    # The auto-jump-to-the-new-song behavior (the redesign's actual goal)
+    # must still work in the common case: nothing unsaved to lose.
+    monkeypatch.setattr(app_module, "LyricsDownloaderThread", _FakeLyricsDownloaderThread)
+
+    new_song = tmp_path / "new_from_batch.mp3"
+    new_song.write_bytes(b"")
+
+    window._on_download_files_ready([str(new_song)])
+
+    assert window.current_file_path == str(new_song)

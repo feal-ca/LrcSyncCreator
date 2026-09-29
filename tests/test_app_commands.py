@@ -17,7 +17,7 @@ import pytest
 pytest.importorskip("PyQt6.QtWidgets")
 
 from PyQt6.QtCore import QSettings
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QInputDialog, QMessageBox
 
 import app as app_module
 from app import LrcSyncApp
@@ -163,6 +163,47 @@ def test_find_music_routes_spotify_link_to_batch_import(window, monkeypatch):
     assert calls == [spotify_link]
 
 
+def test_find_music_routes_plain_text_to_soulseek_search(window, monkeypatch):
+    # Review finding RF1 (plan's own Review Focus item, never actually
+    # tested): plain or malformed text must fall through to a direct
+    # Soulseek search, not silently do nothing. Only the Spotify-link
+    # branch was tested above; this covers the other one.
+    from PyQt6.QtWidgets import QDialog
+
+    class _FakeSearchThread:
+        instances = []
+
+        def __init__(self, client, query) -> None:
+            self.client = client
+            self.query = query
+            self.started = False
+            self.results_ready = type("Signal", (), {"connect": lambda self, fn: None})()
+            self.search_failed = type("Signal", (), {"connect": lambda self, fn: None})()
+            _FakeSearchThread.instances.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def isRunning(self) -> bool:
+            return False
+
+    monkeypatch.setattr(app_module, "SoulseekSearchThread", _FakeSearchThread)
+    monkeypatch.setattr(window, "_get_slskd_client", lambda: object())
+    batch_import_calls = []
+    monkeypatch.setattr(window, "_open_batch_import", lambda link: batch_import_calls.append(link))
+    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
+
+    window._find_music()
+    dialog = window._active_find_music_dialog
+    dialog.query_input.setText("Bohemian Rhapsody Queen")
+    dialog.search_button.click()
+
+    assert batch_import_calls == []  # never mistaken for a Spotify link
+    assert len(_FakeSearchThread.instances) == 1
+    assert _FakeSearchThread.instances[0].query == "Bohemian Rhapsody Queen"
+    assert _FakeSearchThread.instances[0].started is True
+
+
 def test_command_table_has_one_find_music_entry_not_two(window):
     labels = [cmd.label for cmd in window._commands]
     assert "Find Music…" in labels
@@ -201,13 +242,20 @@ def test_batch_download_lyrics_accepts_paths_directly(window, monkeypatch):
 
 
 def test_batch_download_lyrics_with_empty_list_shows_info_and_starts_nothing(window, monkeypatch):
+    # Review finding RF5: previously only asserted the negative half
+    # (nothing started) — the "must show the existing message" half of
+    # the requirement went unchecked, so this would still pass even if
+    # the QMessageBox.information call were deleted entirely.
     started = []
+    informed = []
     monkeypatch.setattr(app_module, "LyricsDownloaderThread", lambda files: started.append(files))
-    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: informed.append(a[1:]))
 
     window._batch_download_lyrics([])
 
     assert started == []
+    assert len(informed) == 1
+    assert informed[0] == ("Info", "No missing lyrics to download.")
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +275,47 @@ def test_get_lyrics_does_not_trigger_the_clear_confirmation(window, monkeypatch)
     assert asked == []
     assert len(window._verses) == 1
     assert window._verses[0].get_verse_text() == "new line"
+
+
+def test_get_lyrics_online_does_nothing_with_no_song_loaded(window, monkeypatch):
+    # Review finding RF3: no test previously drove _get_lyrics_online
+    # itself — only _replace_all_verses directly, which never exercises
+    # the song_filename guard this method actually has.
+    asked = []
+    monkeypatch.setattr(QInputDialog, "getText", lambda *a, **k: asked.append(1) or ("", False))
+
+    assert window.song_filename == ""
+    window._get_lyrics_online()
+
+    assert asked == []  # never even prompted for a query
+
+
+def test_on_search_result_replaces_lyrics_without_the_clear_confirmation(window, monkeypatch):
+    # Review finding RF3: exercises the actual bug path (_on_search_result,
+    # the LyricsSearchThread completion handler that _get_lyrics_online
+    # wires up) rather than calling _replace_all_verses directly, which
+    # would still pass even if _on_search_result regressed back to
+    # calling self._clear_lyrics().
+    window._add_verse("[00:01.00]", "old line")
+
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(1) or QMessageBox.StandardButton.Yes)
+
+    window._on_search_result("[00:05.00]new line\n")
+
+    assert asked == []
+    assert [v.get_verse_text() for v in window._verses] == ["new line"]
+    assert window._dirty is True
+
+
+def test_on_search_result_with_no_result_shows_sorry_message(window, monkeypatch):
+    informed = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: informed.append(a[1:]))
+
+    window._on_search_result("")
+
+    assert len(informed) == 1
+    assert informed[0][0] == "Sorry"
 
 
 def test_clear_lyrics_still_confirms_after_the_split(window, monkeypatch):

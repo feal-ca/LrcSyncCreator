@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSplitter, QStackedWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from constants import (
@@ -370,8 +370,14 @@ class LrcSyncApp(QMainWindow):
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(label)
 
-        self._empty_state_add_music_button = QPushButton("+ Add Music")
-        self._empty_state_add_music_button.clicked.connect(self.library_panel.find_music_requested.emit)
+        # Shares the sidebar's own QMenu object (Add Files / Find Music)
+        # rather than a second, hand-built equivalent — the two can never
+        # drift apart, and a zero-state user with local files still has
+        # "Add Files" reachable from here, not just Find Music.
+        self._empty_state_add_music_button = QToolButton()
+        self._empty_state_add_music_button.setText("+ Add Music")
+        self._empty_state_add_music_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._empty_state_add_music_button.setMenu(self.library_panel.add_music_button.menu())
         self._empty_state_add_music_button.setStyleSheet(self._primary_button_style())
         layout.addWidget(self._empty_state_add_music_button, alignment=Qt.AlignmentFlag.AlignCenter)
 
@@ -380,7 +386,11 @@ class LrcSyncApp(QMainWindow):
     def _on_download_files_ready(self, paths: list[str]) -> None:
         self.library_panel.add_files(paths)
         self._fetch_lyrics_for(paths)
-        if paths:
+        # Only auto-jump to the new song when it's safe: switching away
+        # from unsaved sync edits on whatever's currently loaded would
+        # silently discard them, with no confirmation, since this runs
+        # from a background download completing — never do that.
+        if paths and not self._dirty:
             self._load_song(paths[0])
             self.library_panel.select_path(paths[0])
 
@@ -1323,7 +1333,13 @@ class LrcSyncApp(QMainWindow):
 
     def _open_batch_import(self, link: str) -> None:
         self.workspace.setCurrentIndex(WORKSPACE_ACQUIRE)
-        self.download_view.start_fetch(link)
+        # A running search/download thread delivers results by row index
+        # into download_view's table — start_fetch() would wipe that
+        # table (and the row list) out from under it, corrupting the
+        # in-progress batch. Re-entering Find Music while one is active
+        # just shows it instead of restarting.
+        if not self.download_view.is_batch_active():
+            self.download_view.start_fetch(link)
 
     def _start_soulseek_download(
         self, client: SlskdClient, file: SoulseekFile, auto_fetch_lyrics: bool,
@@ -1473,6 +1489,20 @@ class LrcSyncApp(QMainWindow):
 
         if self._slskd_process is not None and self._slskd_process.poll() is None:
             self._slskd_process.terminate()
+
+        # Release the VLC player/instance explicitly rather than relying
+        # on Python GC to eventually free the underlying native
+        # (PipeWire/PulseAudio) resources — found via the test suite
+        # accumulating dozens of never-released VLC instances across
+        # many LrcSyncApp constructions in one process and eventually
+        # crashing inside VLC's PipeWire plugin. Never manifests in real
+        # usage (the app only ever constructs one window), but closing
+        # cleanly is correct regardless.
+        self._poll_timer.stop()
+        self.player.stop()
+        self.player.release()
+        self._vlc.release()
+
         event.accept()
 
     # ==================================================================

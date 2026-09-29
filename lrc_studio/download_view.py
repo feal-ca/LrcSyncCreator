@@ -123,6 +123,16 @@ class DownloadView(QWidget):
         stop_thread(self._download_thread)
         stop_thread(self._adhoc_search_thread)
 
+    def is_batch_active(self) -> bool:
+        """True while a fetch, search, or download is in flight — callers
+        (e.g. re-entering Find Music) should not restart a fetch or clear
+        the table/rows while this is true; the running thread would still
+        be delivering results into rows that no longer exist."""
+        return any(
+            thread is not None and thread.isRunning()
+            for thread in (self._fetch_thread, self._search_thread, self._download_thread)
+        )
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
