@@ -77,11 +77,11 @@ Run `./run-lrc.sh`, or directly: `python3 lrc_studio/main.py`.
 
 Pasting a link opens the review workspace, next to your library rather than replacing it:
 1. Every track is fuzzy-matched (artist + title) against your library folder first — tracks you already have are marked "In Library" immediately. Spotify's public embed page (no login needed) caps album/playlist links at their first 50 tracks; longer ones are clearly flagged as truncated rather than silently dropping the rest.
-2. Everything missing gets auto-searched on Soulseek right away and the table fills in with each track's best match (quality, size, upload-slot status) — but **nothing downloads yet**.
+2. Everything missing gets auto-searched on Soulseek right away and the table fills in with each track's best match (quality, size, upload-slot status) — but **nothing downloads yet**. The pick favors whichever good-enough file will arrive soonest: any lossless file or lossy one at 192 kbps or more (128 for Opus/Vorbis) counts as good enough, and among those a free upload slot, a short queue and a fast peer beat extra bitrate.
 3. Review the **Match** column. Don't like a pick (wrong version, low bitrate, no free slot)? Click **Change Match** on that row to see every candidate and pick a different one, or re-run the search with an edited query.
-4. Click **Download All Missing** (or a single row's **Download**) to actually fetch whatever's currently selected per row. Live per-row status, an overall progress bar, and a **Cancel** button for the whole batch.
+4. Click **Download All Missing** (or a single row's **Download**) to actually fetch whatever's currently selected per row. Live per-row status, an overall progress bar, and a **Cancel** button for the whole batch. If a source rejects the request or stops sending for three minutes, the row moves on to its next candidate by itself (up to three sources per track); a slow transfer that keeps making progress is left to finish.
 5. Finished downloads get lyrics fetched automatically and appear in the library immediately as each one lands — no need to switch views to see it happened. Once a batch finishes, the editor opens on the first newly-downloaded song, ready to sync.
-6. Rows that failed get a **Retry Search** or **Retry** (download) action, whichever applies.
+6. Rows that failed get a **Retry Search** or **Retry** (download) action, whichever applies. A download retry starts from a source that hasn't failed yet; hover the status to see why each one failed.
 
 Typing a plain search instead of pasting a link is for a one-off track outside any playlist: pick a result, and it downloads straight into your library folder and auto-fetches lyrics.
 

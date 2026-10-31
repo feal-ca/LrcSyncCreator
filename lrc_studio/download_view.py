@@ -69,6 +69,7 @@ class _RowState:
     status: str = "queued"
     candidates: list = field(default_factory=list)   # list[SoulseekFile]
     selected: SoulseekFile | None = None
+    tried_peers: set = field(default_factory=set)   # usernames already tried for this row
     local_path: str | None = None
     detail: str = ""
 
@@ -317,6 +318,7 @@ class DownloadView(QWidget):
         state = self._rows[row_index]
         state.candidates = candidates
         state.selected = candidates[0]
+        state.tried_peers = set()
         state.status = "matched"
         self._update_row_display(row_index)
 
@@ -383,7 +385,7 @@ class DownloadView(QWidget):
         if client is None:
             return
         rows = [
-            (i, r.selected) for i, r in enumerate(self._rows)
+            (i, self._download_order(r)) for i, r in enumerate(self._rows)
             if r.selected and r.status not in ("download_queued", "downloading", "downloaded")
         ]
         if not rows:
@@ -398,9 +400,20 @@ class DownloadView(QWidget):
         state = self._rows[row_index]
         if not state.selected:
             return
-        self._start_download(client, [(row_index, state.selected)])
+        self._start_download(client, [(row_index, self._download_order(state))])
 
-    def _start_download(self, client: SlskdClient, rows: list[tuple[int, SoulseekFile]]) -> None:
+    @staticmethod
+    def _download_order(state: _RowState) -> list[SoulseekFile]:
+        """The chosen match first, then the row's other candidates as
+        automatic fallbacks if it fails (see PlaylistDownloadThread) —
+        peers that already failed this row go last."""
+        others = [c for c in state.candidates if c is not state.selected]
+        others.sort(key=lambda c: c.username in state.tried_peers)
+        return [state.selected] + others
+
+    def _start_download(
+        self, client: SlskdClient, rows: list[tuple[int, list[SoulseekFile]]],
+    ) -> None:
         if self._download_thread is not None and self._download_thread.isRunning():
             QMessageBox.information(
                 self, "Download In Progress",
@@ -425,6 +438,7 @@ class DownloadView(QWidget):
         self._download_thread.progress.connect(self.status_label.setText)
         self._download_thread.track_progress.connect(self._on_download_progress)
         self._download_thread.track_downloading.connect(self._on_track_downloading)
+        self._download_thread.track_attempt.connect(self._on_track_attempt)
         self._download_thread.track_done.connect(self._on_track_downloaded)
         self._download_thread.finished_downloads.connect(self._on_downloads_finished)
         self._current_cancel_target = self._download_thread
@@ -443,6 +457,14 @@ class DownloadView(QWidget):
         self._rows[row_index].status = "downloading"
         self._update_row_display(row_index)
 
+    def _on_track_attempt(self, row_index: int, file: SoulseekFile) -> None:
+        # Keep the Match column on the source actually being tried, so a
+        # fallback is visible and a later "Retry" starts from it.
+        state = self._rows[row_index]
+        state.selected = file
+        state.tried_peers.add(file.username)
+        self._update_row_display(row_index)
+
     def _on_track_downloaded(self, row_index: int, ok: bool, detail: str, local_path: str) -> None:
         state = self._rows[row_index]
         if ok:
@@ -453,6 +475,10 @@ class DownloadView(QWidget):
         else:
             state.status = "download_failed"
             state.detail = detail
+            # Point "Retry" at a source that hasn't failed yet, if any left.
+            fresh = [c for c in state.candidates if c.username not in state.tried_peers]
+            if fresh:
+                state.selected = fresh[0]
         self._update_row_display(row_index)
 
     def _on_downloads_finished(self) -> None:

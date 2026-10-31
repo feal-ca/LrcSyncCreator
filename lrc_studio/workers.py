@@ -160,6 +160,8 @@ def wait_for_download_and_move(
     timeout_s: float,
     cancel_event: threading.Event | None = None,
     progress: pyqtSignal | None = None,
+    max_total_s: float = 1800.0,
+    poll_s: float = 2.0,
 ) -> tuple[bool, str, str]:
     """Poll for *file* to land in ``downloads_dir``, then move it into the library.
 
@@ -169,28 +171,70 @@ def wait_for_download_and_move(
     ``SoulseekDownloadThread`` (single-track) and ``PlaylistDownloadThread``
     (batch) so a fix to this logic only has to land once.
 
+    *timeout_s* is how long to wait **without progress**, not in total:
+    every poll also reads slskd's transfer record, and any change in
+    bytes transferred, state, or queue position resets the clock — a
+    24 MB FLAC from a peer uploading at ~130 KB/s legitimately takes over
+    three minutes, and used to be reported as failed seconds before it
+    finished. A transfer slskd itself marks as failed (rejected, errored,
+    timed out, cancelled) ends the wait immediately with slskd's reason.
+    *max_total_s* is a backstop so nothing waits forever.
+
     *cancel_event*, if given, is checked each poll so a batch download can
     be interrupted mid-wait. *progress*, if given, is emitted each poll
-    with slskd's own transfer-state string (skipped for batch downloads to
-    avoid one extra API call per row per poll tick).
+    with a short transfer-status string.
 
     Returns ``(success, detail, path)``: on success, *detail* is a short
     status string (``"Already in library."`` or the moved file's basename)
     and *path* is its final location; on failure, *detail* is the error
     message and *path* is ``""``.
     """
-    deadline = time.monotonic() + timeout_s
+    start = time.monotonic()
+    last_progress_at = start
+    last_signature = None
+    failure = ""
     local_path = None
-    while time.monotonic() < deadline:
+    while True:
         if cancel_event is not None and cancel_event.is_set():
             break
         local_path = find_downloaded_file(downloads_dir, file.filename, file.size)
         if local_path:
             break
+
+        now = time.monotonic()
+        transfer = client.get_download_transfer(file.username, file.filename) or {}
+        state = transfer.get("state") or ""
+        done = transfer.get("bytesTransferred") or 0
+        signature = (state, done, transfer.get("placeInQueue"))
+        if signature != last_signature:
+            last_signature = signature
+            last_progress_at = now
+
+        # "Completed, Succeeded" just means the file is about to appear —
+        # keep polling for it; any other "Completed, …" is a dead transfer.
+        if state.startswith("Completed") and "Succeeded" not in state:
+            reason = transfer.get("exception") or state.split(",", 1)[-1].strip()
+            failure = f"{file.username} couldn't send {file.display_name}: {reason}"
+            break
+        if now - last_progress_at >= timeout_s:
+            failure = (
+                f"Download of {file.display_name} stalled "
+                f"({state or 'no transfer state'}, no progress for {int(timeout_s)}s)."
+            )
+            break
+        if now - start >= max_total_s:
+            failure = f"Gave up on {file.display_name} after {int(max_total_s // 60)} min."
+            break
+
         if progress is not None:
-            state = client.get_download_state(file.username, file.filename)
-            progress.emit(f"{file.display_name}: {state or 'waiting…'}")
-        time.sleep(2)
+            if state == "InProgress" and file.size:
+                status = f"downloading {100 * done // file.size}%"
+            elif transfer.get("placeInQueue"):
+                status = f"{state} (#{transfer['placeInQueue']} in queue)"
+            else:
+                status = state or "waiting…"
+            progress.emit(f"{file.display_name}: {status}")
+        time.sleep(poll_s)
 
     if cancel_event is not None and cancel_event.is_set() and not local_path:
         return False, "Cancelled.", ""
@@ -202,7 +246,7 @@ def wait_for_download_and_move(
         already_in_library = find_downloaded_file(library_dir, file.filename, file.size)
         if already_in_library:
             return True, "Already in library.", already_in_library
-        return False, f"Timed out waiting for {file.display_name}.", ""
+        return False, failure, ""
 
     try:
         os.makedirs(library_dir, exist_ok=True)
@@ -235,10 +279,10 @@ class SoulseekSearchThread(QThread):
 class SoulseekDownloadThread(QThread):
     """Queue a Soulseek download, wait for it to land, and move it into the library.
 
-    slskd hands off the actual peer-to-peer transfer; this thread just
-    polls for the file's arrival in slskd's downloads directory (see
-    ``find_downloaded_file``) rather than trusting any specific transfer-
-    state schema to signal completion.
+    slskd hands off the actual peer-to-peer transfer; this thread waits
+    for the file's arrival in slskd's downloads directory, using slskd's
+    transfer record to tell slow-but-moving from stalled or failed (see
+    ``wait_for_download_and_move``).
     """
 
     progress      = pyqtSignal(str)
@@ -387,15 +431,21 @@ class PlaylistSearchThread(QThread):
 class PlaylistDownloadThread(QThread):
     """Download a set of already-chosen Soulseek candidates for playlist rows.
 
-    Rows and their candidates are picked ahead of time (auto-matched, or
-    overridden by the user via "Change Match") — this thread only
-    executes the actual transfer, reusing the same move/already-in-
-    library-fallback logic as ``SoulseekDownloadThread``.
+    Each row comes with its candidates in preference order — the chosen
+    match first (auto-matched, or overridden by the user via "Change
+    Match"), then the rest of its search results. If a source rejects the
+    request, errors out, or stalls, the next candidate is tried
+    automatically (skipping other files from a peer that already failed),
+    up to ``MAX_ATTEMPTS`` per row — so one unreliable peer doesn't fail
+    a track that ten others could have sent.
     """
+
+    MAX_ATTEMPTS = 3
 
     progress          = pyqtSignal(str)
     track_progress    = pyqtSignal(int, int)                # (rows done, rows total)
     track_downloading = pyqtSignal(int)                      # row_index about to be downloaded — sequential
+    track_attempt     = pyqtSignal(int, object)              # (row_index, SoulseekFile now being tried)
     track_done        = pyqtSignal(int, bool, str, str)      # (row_index, success, detail, local_path)
     finished_downloads = pyqtSignal()
 
@@ -404,7 +454,7 @@ class PlaylistDownloadThread(QThread):
         client: SlskdClient,
         downloads_dir: str,
         library_dir: str,
-        rows: list[tuple[int, SoulseekFile]],
+        rows: list[tuple[int, list[SoulseekFile]]],
         timeout_s: float = 180.0,
     ) -> None:
         super().__init__()
@@ -422,17 +472,16 @@ class PlaylistDownloadThread(QThread):
         total = len(self._rows)
         consecutive_connection_failures = 0
 
-        for i, (row_index, file) in enumerate(self._rows, 1):
+        for i, (row_index, candidates) in enumerate(self._rows, 1):
             if self._cancel_event.is_set():
                 self.progress.emit(f"Cancelled — {total - i + 1} track(s) skipped.")
                 self._mark_unprocessed(self._rows[i - 1:], "Not downloaded — cancelled.")
                 break
 
             self.track_progress.emit(i - 1, total)
-            self.progress.emit(f"[{i}/{total}] Downloading: {file.display_name}")
             self.track_downloading.emit(row_index)
             try:
-                self._client.download(file)
+                ok, detail, path = self._download_with_fallback(i, total, row_index, candidates)
                 consecutive_connection_failures = 0
             except SlskdConnectionError as exc:
                 consecutive_connection_failures += 1
@@ -447,19 +496,7 @@ class PlaylistDownloadThread(QThread):
                     )
                     break
                 continue
-            except SlskdError as exc:
-                self.track_done.emit(row_index, False, str(exc), "")
-                continue
             except Exception as exc:  # noqa: BLE001 — never let one bad row kill the batch
-                self.track_done.emit(row_index, False, f"Unexpected error: {exc}", "")
-                continue
-
-            try:
-                ok, detail, path = wait_for_download_and_move(
-                    self._client, self._downloads_dir, self._library_dir, file,
-                    self._timeout_s, cancel_event=self._cancel_event,
-                )
-            except Exception as exc:  # noqa: BLE001
                 self.track_done.emit(row_index, False, f"Unexpected error: {exc}", "")
                 continue
 
@@ -473,11 +510,59 @@ class PlaylistDownloadThread(QThread):
         self.track_progress.emit(total, total)
         self.finished_downloads.emit()
 
-    def _mark_unprocessed(self, remaining: list[tuple[int, SoulseekFile]], reason: str) -> None:
+    def _download_with_fallback(
+        self, i: int, total: int, row_index: int, candidates: list[SoulseekFile],
+    ) -> tuple[bool, str, str]:
+        """Try *candidates* in order until one lands. Same return shape as
+        ``wait_for_download_and_move``; on total failure, *detail* lists
+        why each source failed. SlskdConnectionError propagates — when
+        slskd itself is down, trying another peer can't help."""
+        failed_peers: set[str] = set()
+        errors: list[str] = []
+        for file in candidates:
+            if len(errors) >= self.MAX_ATTEMPTS:
+                break
+            if file.username in failed_peers:
+                continue
+
+            self.track_attempt.emit(row_index, file)
+            retry_note = f" (trying source {len(errors) + 1})" if errors else ""
+            self.progress.emit(f"[{i}/{total}] Downloading: {file.display_name}{retry_note}")
+            try:
+                self._client.download(file)
+            except SlskdConnectionError:
+                raise
+            except SlskdError as exc:
+                failed_peers.add(file.username)
+                errors.append(f"{file.username}: {exc}")
+                continue
+
+            ok, detail, path = wait_for_download_and_move(
+                self._client, self._downloads_dir, self._library_dir, file,
+                self._timeout_s, cancel_event=self._cancel_event,
+            )
+            if ok or detail == "Cancelled.":
+                return ok, detail, path
+
+            # Stop a stalled transfer before moving on, or it may still
+            # finish later and leave a stray second copy behind.
+            self._client.cancel_download(file.username, file.filename)
+            failed_peers.add(file.username)
+            errors.append(detail)
+
+        if not errors:
+            return False, "No candidates to download.", ""
+        if len(errors) == 1:
+            return False, errors[0], ""
+        return False, f"Tried {len(errors)} sources, all failed:\n" + "\n".join(errors), ""
+
+    def _mark_unprocessed(
+        self, remaining: list[tuple[int, list[SoulseekFile]]], reason: str,
+    ) -> None:
         """Resolve every row the loop never reached so none stay stuck on
         "Downloading…" forever — see PlaylistSearchThread._mark_unprocessed
         for why this is needed."""
-        for row_index, _file in remaining:
+        for row_index, _candidates in remaining:
             self.track_done.emit(row_index, False, reason, "")
 
 

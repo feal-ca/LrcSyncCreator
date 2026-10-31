@@ -134,3 +134,51 @@ def test_is_batch_active_true_when_download_thread_running(view):
 
     view._download_thread = _RunningThread()
     assert view.is_batch_active() is True
+
+
+# ---------------------------------------------------------------------------
+# Automatic fallback: failed sources move to the back, and "Retry" starts
+# from a source that hasn't failed yet.
+# ---------------------------------------------------------------------------
+
+def _cand(username):
+    from soulseek import SoulseekFile
+    return SoulseekFile(
+        username=username, filename=f"music\\{username}.mp3", size=1, bitrate=320,
+        length_s=200, queue_length=0, has_free_slot=True,
+    )
+
+
+def _one_row(view, candidates):
+    from PyQt6.QtWidgets import QTableWidgetItem
+    from download_view import _RowState
+
+    class _FakeTrack:
+        query = "Fake Artist Fake Title"
+
+    view._rows = [_RowState(track=_FakeTrack(), status="matched",
+                            candidates=candidates, selected=candidates[0])]
+    view.table.setRowCount(1)
+    for col in (0, 1, 2):
+        view.table.setItem(0, col, QTableWidgetItem(""))
+    return view._rows[0]
+
+
+def test_download_order_puts_selected_first_then_other_candidates(view):
+    a, b, c = _cand("a"), _cand("b"), _cand("c")
+    state = _one_row(view, [a, b, c])
+    state.selected = b
+
+    assert view._download_order(state) == [b, a, c]
+
+
+def test_retry_after_failure_starts_from_an_untried_source(view):
+    a, b, c, d = _cand("a"), _cand("b"), _cand("c"), _cand("d")
+    state = _one_row(view, [a, b, c, d])
+
+    for f in (a, b, c):
+        view._on_track_attempt(0, f)
+    view._on_track_downloaded(0, False, "Tried 3 sources, all failed", "")
+
+    assert state.selected is d
+    assert view._download_order(state) == [d, a, b, c]

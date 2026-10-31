@@ -32,6 +32,21 @@ AUDIO_EXTENSIONS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus")
 # clean "artist title" string doesn't have.
 _DEFAULT_RELEVANCE_THRESHOLD = 65
 
+# At or above this relevance score a candidate counts as clearly the right
+# song, and the remaining few points are just filename noise (a track
+# number, a folder name) — so it shouldn't outrank a candidate that will
+# actually arrive sooner.
+_STRONG_MATCH_SCORE = 90
+
+# "Mid-high quality" floor, in kbps. Anything at or above it is good
+# enough, and past that point download speed matters more than squeezing
+# out more bitrate (a FLAC is ~3x a 320k MP3 and often arrives far later).
+# Opus/Vorbis hold up at lower bitrates than MP3/AAC.
+_MIN_LOSSY_KBPS = 192
+_MIN_EFFICIENT_LOSSY_KBPS = 128
+_EFFICIENT_LOSSY_EXTENSIONS = (".opus", ".ogg")
+_LOSSLESS_EXTENSIONS = (".flac", ".wav")
+
 # Parenthetical/bracketed asides ("(feat. X)", "[Explicit]") and trailing
 # version/remaster suffixes ("- Remastered 2011", "- Radio Edit") are
 # common in Spotify metadata but rarely appear verbatim in how peers name
@@ -83,17 +98,69 @@ class SoulseekFile:
     length_s: int | None
     queue_length: int
     has_free_slot: bool
+    upload_speed: int | None = None   # peer's advertised upload speed, bytes/s
 
     @property
     def display_name(self) -> str:
         return self.filename.replace("\\", "/").rsplit("/", 1)[-1]
 
     @property
+    def is_lossless(self) -> bool:
+        return self.filename.lower().endswith(_LOSSLESS_EXTENSIONS)
+
+    @property
+    def effective_kbps(self) -> int | None:
+        """Reported bitrate, or one estimated from size and duration."""
+        if self.bitrate:
+            return self.bitrate
+        if self.length_s and self.size:
+            return int(self.size * 8 / self.length_s / 1000)
+        return None
+
+    @property
+    def quality_ok(self) -> bool | None:
+        """Mid-high quality or better? None when there's no way to tell."""
+        if self.is_lossless:
+            return True
+        kbps = self.effective_kbps
+        if kbps is None:
+            return None
+        floor = (
+            _MIN_EFFICIENT_LOSSY_KBPS
+            if self.filename.lower().endswith(_EFFICIENT_LOSSY_EXTENSIONS)
+            else _MIN_LOSSY_KBPS
+        )
+        return kbps >= floor
+
+    @property
+    def expected_seconds(self) -> float | None:
+        """Rough transfer time from the peer's advertised speed."""
+        if self.upload_speed:
+            return self.size / self.upload_speed
+        return None
+
+    @property
     def quality_label(self) -> str:
         mb = self.size / (1024 * 1024)
-        bits = f"{self.bitrate}kbps" if self.bitrate else "?kbps"
+        bits = "lossless" if self.is_lossless else (
+            f"{self.bitrate}kbps" if self.bitrate else "?kbps"
+        )
         slot = "free slot" if self.has_free_slot else f"queued ({self.queue_length})"
         return f"{bits}, {mb:.1f}MB, {slot}"
+
+
+def availability_key(f: SoulseekFile) -> tuple:
+    """Sort key among equally relevant candidates: good-enough quality
+    first, then whoever can send it soonest — a free slot over a queue,
+    a short queue over a long one, then the shortest expected transfer."""
+    quality_rank = {True: 0, None: 1, False: 2}[f.quality_ok]
+    expected = f.expected_seconds
+    return (
+        quality_rank,
+        not f.has_free_slot,
+        f.queue_length,
+        expected if expected is not None else float("inf"),
+    )
 
 
 class SlskdClient:
@@ -236,9 +303,10 @@ class SlskdClient:
                     length_s=f.get("length"),
                     queue_length=r.get("queueLength", 0),
                     has_free_slot=r.get("hasFreeUploadSlot", False),
+                    upload_speed=r.get("uploadSpeed"),
                 ))
 
-        results.sort(key=lambda f: (not f.has_free_slot, f.queue_length, -(f.bitrate or 0)))
+        results.sort(key=availability_key)
         return results
 
     def download(self, file: SoulseekFile) -> None:
@@ -248,13 +316,31 @@ class SlskdClient:
             json=[{"filename": file.filename, "size": file.size}],
         )
 
-    def get_download_state(self, username: str, filename: str) -> str | None:
-        """Best-effort transfer state lookup; None if it can't be determined.
+    def cancel_download(self, username: str, filename: str) -> None:
+        """Best-effort cancel of an abandoned download, so a stalled
+        transfer that's been given up on doesn't finish later and leave a
+        stray copy behind. Silently does nothing if it can't."""
+        transfer = self.get_download_transfer(username, filename)
+        if not transfer or not transfer.get("id"):
+            return
+        try:
+            self._request(
+                "DELETE", f"/api/v0/transfers/downloads/{username}/{transfer['id']}",
+                params={"remove": "false"},
+            )
+        except SlskdError:
+            pass
 
-        Tolerant of minor schema differences across slskd versions — this
-        is advisory only (used for a status message), never load-bearing;
-        completion is ultimately confirmed by the file actually landing in
-        the downloads directory (see ``find_downloaded_file``).
+    def get_download_transfer(self, username: str, filename: str) -> dict | None:
+        """Best-effort lookup of slskd's transfer record for one download.
+
+        Returns the raw record (``state`` e.g. ``"InProgress"`` /
+        ``"Queued, Remotely"`` / ``"Completed, Rejected"``,
+        ``bytesTransferred``, ``exception``, ``placeInQueue``…), or None if
+        it can't be found. Used to tell a slow-but-moving transfer from a
+        stalled or failed one; completion itself is still confirmed by the
+        file actually landing in the downloads directory (see
+        ``find_downloaded_file``).
         """
         try:
             data = self._request("GET", f"/api/v0/transfers/downloads/{username}").json()
@@ -263,7 +349,7 @@ class SlskdClient:
         for directory in data.get("directories", []) or []:
             for f in directory.get("files", []) or []:
                 if f.get("filename") == filename:
-                    return f.get("state")
+                    return f
         return None
 
 
@@ -303,10 +389,18 @@ def _relevance_score(remote_path: str, artist: str, title: str) -> int:
     cover, a same-named song) shouldn't outrank a real match.
     """
     path_lower = remote_path.replace("\\", "/").lower()
-    filename = path_lower.rsplit("/", 1)[-1]
-    artist_score = fuzz.partial_ratio(artist.lower(), path_lower) if artist else 100
-    title_score = fuzz.partial_token_sort_ratio(title.lower(), filename) if title else 100
+    path_norm = _normalize_for_match(path_lower)
+    filename_norm = _normalize_for_match(os.path.splitext(path_lower.rsplit("/", 1)[-1])[0])
+    artist_score = fuzz.partial_ratio(_normalize_for_match(artist.lower()), path_norm) if artist else 100
+    title_score = fuzz.partial_ratio(_normalize_for_match(title.lower()), filename_norm) if title else 100
     return int(min(artist_score, title_score))
+
+
+def _normalize_for_match(text: str) -> str:
+    """Punctuation and underscores to single spaces ("01-ma_beauté" ->
+    "01 ma beauté"), so separators peers use instead of spaces don't cost
+    a correct match points."""
+    return re.sub(r"[\W_]+", " ", text).strip()
 
 
 def _filter_and_rank(
@@ -316,8 +410,13 @@ def _filter_and_rank(
         (_relevance_score(f.filename, artist, title), f) for f in results
     ]
     scored = [pair for pair in scored if pair[0] >= min_score]
+    # Strong matches all tie on relevance, so availability decides among
+    # them; weaker matches still rank by score first, so a loosely matched
+    # wrong song never outranks a likelier one just by being faster.
     scored.sort(key=lambda pair: (
-        -pair[0], not pair[1].has_free_slot, pair[1].queue_length, -(pair[1].bitrate or 0),
+        -min(pair[0], _STRONG_MATCH_SCORE),
+        availability_key(pair[1]),
+        -pair[0],
     ))
     return [f for _score, f in scored]
 
