@@ -14,16 +14,15 @@ from PyQt6.QtWidgets import (
     QPushButton, QWidget,
 )
 
+import theme
 from constants import (
     BUTTON_SIZE,
-    COLOR_ACCENT,
-    COLOR_MISSING,
+    COLOR_FG,
     COLOR_TIMELINE_ACTIVE,
     COLOR_TIMELINE_BG,
     COLOR_TIMELINE_BLOCK,
     COLOR_TIMELINE_SEL,
     COLOR_SEL_BOX,
-    COLOR_SYNCED,
 )
 from utils import parse_lrc_timestamp
 
@@ -54,10 +53,7 @@ class TimelineWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setFixedHeight(90)
-        self.setStyleSheet(
-            f"background-color: {COLOR_TIMELINE_BG.name()};"
-            " border: 1px solid #45475a; border-radius: 5px;"
-        )
+        self.setToolTip("Click to seek · drag a marker to retime it · drag empty space to select several")
 
         self.duration_ms:        int       = 1
         self.timestamps:         list[int] = []
@@ -108,18 +104,26 @@ class TimelineWidget(QWidget):
     def paintEvent(self, _event: QEvent) -> None:  # type: ignore[override]
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), COLOR_TIMELINE_BG)
+        painter.setPen(QPen(QColor(theme.LINE_SOFT), 1))
+        painter.setBrush(QBrush(COLOR_TIMELINE_BG))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 10, 10)
 
-        # ── 30-second grid lines ─────────────────────────────────────
-        painter.setPen(QPen(QColor(255, 255, 255, 20), 1))
+        # ── 30-second grid lines, labelled once a minute ─────────────
         step = 30_000
-        for t in range(0, self.duration_ms, step):
+        label_font = theme.mono_font(8)
+        painter.setFont(label_font)
+        for t in range(step, max(self.duration_ms, 1), step):
             x = int(self._ms_to_x(t))
-            painter.drawLine(x, 0, x, self.height())
+            painter.setPen(QPen(QColor(255, 255, 255, 14), 1))
+            painter.drawLine(x, 6, x, self.height() - 18)
+            if t % 60_000 == 0:
+                painter.setPen(QColor(theme.TEXT_3))
+                painter.drawText(x - 20, self.height() - 16, 40, 14,
+                                 Qt.AlignmentFlag.AlignCenter, f"{t // 60_000}:00")
 
         # ── Verse diamonds ───────────────────────────────────────────
-        mid_y   = self.height() / 2
-        base_w  = 10
+        mid_y   = (self.height() - 12) / 2
+        base_w  = 8
 
         for i, ms in enumerate(self.timestamps):
             x = self._ms_to_x(ms)
@@ -147,9 +151,9 @@ class TimelineWidget(QWidget):
 
         # ── Playhead ─────────────────────────────────────────────────
         px = int(self._ms_to_x(self.current_play_pos))
-        painter.setPen(QPen(COLOR_ACCENT, 2))
+        painter.setPen(QPen(COLOR_FG, 2))
         painter.drawLine(px, 0, px, self.height())
-        painter.setBrush(QBrush(COLOR_ACCENT))
+        painter.setBrush(QBrush(COLOR_FG))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawPolygon([
             QPoint(px, 0),
@@ -160,7 +164,7 @@ class TimelineWidget(QWidget):
         # ── Rubber-band selection box ─────────────────────────────────
         if self._is_box_select:
             painter.setBrush(QBrush(COLOR_SEL_BOX))
-            painter.setPen(QPen(COLOR_ACCENT, 1))
+            painter.setPen(QPen(COLOR_TIMELINE_SEL, 1))
             painter.drawRect(self._selection_rect)
 
     # ------------------------------------------------------------------
@@ -315,33 +319,25 @@ class Verse(QWidget):
 
         # Timestamp label
         self.timestamp_label = QLabel(timestamp)
-        self.timestamp_label.setFixedWidth(70)
-        self.timestamp_label.setStyleSheet(
-            f"color: {COLOR_ACCENT.name()};"
-            " font-family: monospace; font-weight: bold; font-size: 13px;"
-        )
+        self.timestamp_label.setFixedWidth(84)
+        self.timestamp_label.setFont(theme.mono_font(10))
+        self.timestamp_label.setStyleSheet(f"color: {theme.TEXT_2};")
         inner_layout.addWidget(self.timestamp_label)
 
         # Lyrics text field
         self.verse_text = QLineEdit(verse)
         self.verse_text.setStyleSheet(
-            "border: none; background: transparent; color: white; font-size: 14px;"
+            "QLineEdit { border: none; background: transparent; padding: 2px 0;"
+            f" font-size: 11pt; color: {theme.TEXT}; }}"
         )
         self.verse_text.setPlaceholderText("Lyrics here…")
         self.verse_text.installEventFilter(self)
         inner_layout.addWidget(self.verse_text, stretch=1)
 
         # ── Action buttons ────────────────────────────────────────────
-        _btn = (
-            "QPushButton { border-radius: 4px; font-weight: bold; padding: 2px; }"
-            "QPushButton:hover { background-color: #45475a; }"
-        )
-
-        self.sync_button = self._make_button("⏱", "#4a34aa", _btn, "Sync to Now")
-        self.add_button  = self._make_button("+",  "#313244", _btn, "Insert Line After")
-        self.delete_button = self._make_button(
-            "✕", COLOR_MISSING.name(), _btn, "Delete Line"
-        )
+        self.sync_button = self._make_button("⏱", theme.TEXT, "Stamp this line with the current playback time (S)")
+        self.add_button  = self._make_button("+", theme.TEXT, "Insert a line after this one")
+        self.delete_button = self._make_button("✕", theme.DANGER, "Delete this line")
 
         inner_layout.addWidget(self.sync_button)
         inner_layout.addWidget(self.add_button)
@@ -351,16 +347,16 @@ class Verse(QWidget):
         self.setLayout(outer)
 
     @staticmethod
-    def _make_button(
-        text: str,
-        bg: str,
-        extra_style: str,
-        tooltip: str,
-    ) -> QPushButton:
+    def _make_button(text: str, hover_color: str, tooltip: str) -> QPushButton:
         btn = QPushButton(text)
         btn.setFixedSize(BUTTON_SIZE, BUTTON_SIZE)
-        btn.setStyleSheet(f"background-color: {bg}; {extra_style}")
+        btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; border: none; color: {theme.TEXT_3};"
+            " border-radius: 6px; padding: 0; font-size: 12px; }"
+            f"QPushButton:hover {{ background: {theme.HOVER}; color: {hover_color}; }}"
+        )
         btn.setToolTip(tooltip)
+        btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         return btn
 
     # ------------------------------------------------------------------
@@ -415,11 +411,14 @@ class Verse(QWidget):
 
     def _compute_style(self) -> str:
         if self._is_active:
-            bg, border = "#3e3e5e", f"2px solid {COLOR_SYNCED.name()}"
+            bg, border = theme.RAISED, f"1px solid {theme.LINE}"
         else:
-            bg, border = "#2a2a3a", "1px solid #45475a"
+            bg, border = "transparent", "1px solid transparent"
         left_accent = (
-            f"4px solid {COLOR_TIMELINE_ACTIVE.name()}" if self._is_playing
-            else "4px solid transparent"
+            f"3px solid {COLOR_TIMELINE_ACTIVE.name()}" if self._is_playing
+            else "3px solid transparent"
         )
+        stamp_color = theme.ACCENT if (self._is_playing or self._is_active) else theme.TEXT_2
+        if hasattr(self, "timestamp_label"):
+            self.timestamp_label.setStyleSheet(f"color: {stamp_color};")
         return self._STYLE.format(bg=bg, border=border, left_accent=left_accent)

@@ -1,5 +1,5 @@
 """
-constants.py — Application-wide constants and Catppuccin Mocha colour tokens.
+constants.py — Application-wide constants and colour handles.
 """
 
 from PyQt6.QtGui import QColor
@@ -25,7 +25,7 @@ DEFAULT_TIMESTAMP: str = "[00:00.00]"
 # ---------------------------------------------------------------------------
 
 AUDIO_EXTENSIONS: tuple[str, ...] = (
-    ".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus"
+    ".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aiff", ".aif",
 )
 
 # Characters that are illegal on at least one major OS file system.
@@ -43,18 +43,24 @@ MAX_UNDO: int = 100
 BUTTON_SIZE: int = 28   # px — square action buttons on each Verse row
 
 # ---------------------------------------------------------------------------
-# Catppuccin Mocha colour palette
+# Colours — QColor views of the tokens in theme.py, for code
+# that paints or compares colours directly. The status colours double as
+# status keys (see utils.analyze_lrc_status).
 # ---------------------------------------------------------------------------
 
-COLOR_BG             = QColor("#1e1e2e")   # main window background
-COLOR_FG             = QColor("#cdd6f4")   # primary text
-COLOR_MUTED          = QColor("#6c7086")   # placeholders, secondary/group labels
-COLOR_ACCENT         = QColor("#89b4fa")   # interactive elements / playhead
-COLOR_SYNCED         = QColor("#a6e3a1")   # file has good synced LRC
-COLOR_UNSYNCED       = QColor("#f9e2af")   # file has LRC but timestamps are all 0
-COLOR_MISSING        = QColor("#f38ba8")   # no LRC file at all
-COLOR_TIMELINE_BG    = QColor("#181825")   # timeline widget background
-COLOR_TIMELINE_BLOCK = QColor("#4a34aa")   # normal verse diamond on timeline
-COLOR_TIMELINE_ACTIVE = QColor("#f5c2e7")  # currently-selected verse diamond
-COLOR_TIMELINE_SEL   = QColor("#f9e2af")   # drag-selected verse diamond
-COLOR_SEL_BOX        = QColor(137, 180, 250, 40)  # rubber-band selection fill
+import theme as _t
+
+COLOR_BG             = QColor(_t.BASE)
+COLOR_FG             = QColor(_t.TEXT)
+COLOR_MUTED          = QColor(_t.TEXT_2)
+COLOR_FAINT          = QColor(_t.TEXT_3)
+COLOR_ACCENT         = QColor(_t.ACCENT)
+COLOR_DANGER         = QColor(_t.DANGER)       # errors and destructive actions only
+COLOR_SYNCED         = QColor(_t.OK)           # file has good synced LRC
+COLOR_UNSYNCED       = QColor(_t.PLAIN)        # lyrics present, timestamps all 0 / missing
+COLOR_MISSING        = QColor("#7A766F")       # no LRC file at all (not an error)
+COLOR_TIMELINE_BG    = QColor(_t.SURFACE)
+COLOR_TIMELINE_BLOCK = QColor("#6E6A63")       # verse marker on the timeline
+COLOR_TIMELINE_ACTIVE = QColor(_t.ACCENT)      # currently-selected verse marker
+COLOR_TIMELINE_SEL   = QColor(_t.PLAIN)        # drag-selected verse markers
+COLOR_SEL_BOX        = QColor(205, 177, 121, 40)  # rubber-band selection fill
