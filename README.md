@@ -1,134 +1,158 @@
 # LRC Studio
 
-LRC Studio downloads songs from a Spotify track, album, or playlist link
-(via Soulseek) and gets them synced lyrics — with a real editor underneath
-for when you want to fine-tune the sync yourself.
+LRC Studio is a desktop app for keeping a music library with synced
+lyrics. It searches and downloads from Soulseek (through slskd), imports
+Spotify tracks, albums and playlists, finds lyrics online, and has an
+editor for syncing them by hand when nothing online fits.
+
 ![Demo](ExampleUseVideo.gif)
----
 
-## Features
+## What it does
 
-1. **Find Music**: one search box, reached from the library's "+ Add Music"
-   menu — type a song to search Soulseek directly, or paste a Spotify
-   track/album/playlist link to pull its whole tracklist. A pasted link
-   fetches, dedupes against your library, and auto-matches every missing
-   track on Soulseek — nothing downloads until you've reviewed the matches
-   (and overridden any you don't like) and click Download.
-2. **The editor**: the audio player, verse list, and timeline for syncing
-   lyrics by hand — everything a downloaded (or manually added) track
-   needs before it's "done." It's always there in the main workspace,
-   ready as soon as you pick a song from the library.
-3. **Audio Playback**: Load and play `.mp3`/`.flac`/`.wav`/`.ogg`/`.m4a`/`.opus` files via VLC, with a seek bar and PipeWire/PulseAudio output-device selection (Linux).
-4. **Lyric Synchronization**: Sync lyrics with audio by adding, adjusting, and editing timestamps — by keyboard, by dragging blocks on the timeline, or with a global ±ms offset for tracks that drift uniformly.
-5. **Verse Management**: Add, delete, sort, or undo verse edits; fast keyboard-driven line entry (press Enter to jump to the next line).
-6. **Keyboard Shortcuts** (see Help → Keyboard Shortcuts in-app for the full list):
-    - **Space**: Toggle play/pause.
-    - **S**: Sync the current line to playback and advance.
-    - **Enter** (in a line): Move to the next line.
-    - **↑ / ↓**: Select previous/next line. **← / →**: Seek -5s/+5s.
-    - **Ctrl+S**: Save. **Ctrl+Z**: Undo last sync. **Ctrl+T**: Sort by time.
-7. **Online Lyrics Fetching**: Search for and import synced lyrics online, individually or in a batch across your whole file list — downloaded tracks get this automatically.
-8. **File Operations**:
-    - Load and save `.lrc` sidecar files.
-    - Optionally embed the same synced lyrics into the audio file's own tags (ID3 USLT / Vorbis comment / MP4 atom).
-    - Prompts to save before you switch songs or closing the app with unsaved changes.
-9. **Validate Sync** (Tools → Validate Sync, optional): a local, offline spot-check of a handful of lines against the audio using [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — flags lines whose text or timing look off. Not installed by default; see below.
-
----
+- Your library folder loads on startup. Every song shows a dot: filled
+  green for synced lyrics, filled sand for lyrics without timing, hollow
+  for none. A search box and a status filter narrow the list, and the line
+  under it counts what is left to do.
+- The Search page works like Nicotine+. Search a title, then type the
+  artist into the filter box (or the other way round). The filter matches
+  the whole remote path and the uploader, ignores accents, and `-word`
+  excludes. You can also filter by format, minimum bitrate and free upload
+  slot, sort by any column, download several files at once, or grab a
+  peer's whole folder (an album).
+- The Downloads page lists every download, from Search and from playlist
+  imports alike, and says what each one is doing: waiting for the peer to
+  answer, its place in the peer's queue, or percent, speed and time left.
+  Up to six run at once. A peer that rejects the request or never answers
+  is dropped for another peer's copy of the same file when one exists, and
+  "Try another source now" (right-click) does it on demand. You can cancel
+  and retry, and the app asks before quitting with downloads running.
+- Finished downloads are converted, renamed and filed. Lossless files
+  (FLAC, WAV, ALAC) become Opus at 192 kbps with tags and cover art kept,
+  and the original is deleted once the Opus file checks out. Lossy files
+  are never re-encoded. Each file is renamed to "Artist - Title" from its
+  tags and moved into the library, and lyrics are fetched for it. All of
+  this can be switched off in Settings.
+- Lyrics come from LRCLIB first, matched on artist, title, album and the
+  track's real duration, so a live cut or an extended mix is not taken
+  for the album version. Then other providers (Musixmatch, NetEase,
+  Megalobiz) are tried, and their results are rejected if their timing
+  runs past the end of the song. Plain text without timing is the last
+  resort, and the dot shows it. Queries come from the file's tags, with
+  track numbers, "(feat. …)" and "- Remastered" stripped.
+- Get lyrics (Ctrl+L) lists the candidates with their length next to
+  your file's, so a version that is 40 seconds longer stands out. Preview
+  one and pick it.
+- Pasting a Spotify link into the search box opens the Playlist page.
+  Every track you don't already have is matched on Soulseek for review
+  before anything downloads. Change match opens the same filterable
+  results, with the artist already typed into the filter.
+- In the editor, press S to stamp the current line, drag markers on the
+  timeline, shift every timestamp at once, and save to a `.lrc` file next
+  to the song. Saving can also embed the lyrics in the file's tags
+  (MP3, FLAC, Opus, OGG, M4A).
+- Tools → Convert Lossless Files to Opus converts the FLAC/WAV/ALAC
+  files already in your library, in place, after asking. The `.lrc`
+  files keep working because the file name only changes its extension.
+- Validate Sync (optional) spot-checks a few lines against the audio
+  with faster-whisper.
 
 ## Installation
 Clone this repository, then install the dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-You'll also need VLC and Qt installed at the system level (the `vlc` binary/libraries, and `pactl` on Linux for the audio-device selector).
+You'll also need VLC installed at the system level, `ffmpeg` for converting downloads to Opus, and `pactl` on Linux for the audio-device selector.
 
-**Optional — Validate Sync:**
+Optional, for Validate Sync:
 ```bash
 pip install -r requirements-optional.txt
 ```
-Also needs `ffmpeg` on your system `PATH` (used to extract the short audio clips it transcribes) — install it via your package manager (e.g. `apt install ffmpeg`, `dnf install ffmpeg`). Without it, every sampled line comes back unable to check.
+Also needs `ffmpeg` on your system `PATH` (used to extract the short audio clips it transcribes). Install it via your package manager (e.g. `apt install ffmpeg`, `dnf install ffmpeg`). Without it, every sampled line comes back unable to check.
 
-Runs locally on CPU; the app measured ~1.5s to load its model plus ~2.5s per sampled line on a 16-thread i7 laptop (first run also downloads a ~150MB model, needs internet once). It only samples a handful of short clips per song, not the whole track, specifically to stay light — see the "Validate Sync" section below for what it can and can't catch.
+Runs locally on CPU; the app measured ~1.5s to load its model plus ~2.5s per sampled line on a 16-thread i7 laptop (first run also downloads a ~150MB model, needs internet once). It only samples a handful of short clips per song, not the whole track, specifically to stay light. See the "Validate Sync" section below for what it can and can't catch.
 
-**Optional — Soulseek / Spotify import:**
+Optional, for Soulseek and Spotify import:
 ```bash
 ./scripts/setup_slskd.sh   # downloads slskd, writes a starter config
 ```
-Then edit `slskd-bin/slskd.yml`: replace the `soulseek.username`/`password` placeholders with a real Soulseek account (Soulseek auto-registers a new username the first time you log in with it — pick something real). You'll likely also want to add a `shares.directories` entry pointing at some real folder of yours — in testing, plenty of peers simply don't respond to searches from accounts sharing zero files.
+Then edit `slskd-bin/slskd.yml`: replace the `soulseek.username`/`password` placeholders with a real Soulseek account (Soulseek auto-registers a new username the first time you log in with it, so pick something real). You'll likely also want to add a `shares.directories` entry pointing at some real folder of yours: in testing, plenty of peers simply don't respond to searches from accounts sharing zero files.
 
-In LRC Studio, go to Tools → Settings and fill in slskd's URL (`http://127.0.0.1:5030` by default) and the API key `setup_slskd.sh` printed. That's the last manual step — the first time a Soulseek feature needs slskd and it isn't already running, LRC Studio launches it itself (via `./scripts/run_slskd.sh`) and waits for it to come up; you can still run that script by hand if you'd rather watch its logs directly.
-
----
+In LRC Studio, go to Tools → Settings and fill in slskd's URL (`http://127.0.0.1:5030` by default) and the API key `setup_slskd.sh` printed. That's the last manual step. The first time a Soulseek feature needs slskd and it isn't already running, LRC Studio launches it itself (via `./scripts/run_slskd.sh`) and waits for it to come up; you can still run that script by hand if you'd rather watch its logs directly.
 
 ## Usage
 
-### Starting the App
-Run `./run-lrc.sh`, or directly: `python3 lrc_studio/main.py`.
+Run `./run-lrc.sh`, or `python3 lrc_studio/main.py`.
 
-### Syncing Lyrics
-1. Add audio files via the library's "+ Add Music" → "Add Files," or drag-and-drop.
-2. Use **Get Lyrics** to fetch existing synced lyrics for the loaded song, or type your own. To fetch lyrics for every file missing them at once, use the library panel's overflow (**⋮**) menu → "Fetch Lyrics for All Missing."
-3. Play the track and press **S** to stamp each line as it starts, or drag verse blocks directly on the timeline to fine-tune.
+Set your music folder and slskd's details once in Tools → Settings
+(Ctrl+,). The library fills itself from that folder on every start;
+drop files or folders on the window to add others. When LRC Studio starts
+slskd itself, slskd's output goes to `slskd-bin/slskd-app.log`.
 
-### Finding & Downloading Music
+### Finding music
 
-**Find Music** (library "+ Add Music" menu, or Tools → Find Music, Ctrl+F) is the main way to get music in. It's one search box: type a song to search Soulseek directly, or paste a Spotify track/album/playlist link to pull its whole tracklist — the app figures out which from what you enter.
+Ctrl+F opens the Search page. Results arrive once peers have answered,
+which takes up to 25 seconds; the counter shows how many have answered so
+far, and "Show results now" stops waiting. Double-click a result or press
+Enter to download it. Right-click for the whole folder, or to show only
+one uploader's files.
 
-Pasting a link opens the review workspace, next to your library rather than replacing it:
-1. Every track is fuzzy-matched (artist + title) against your library folder first — tracks you already have are marked "In Library" immediately. Spotify's public embed page (no login needed) caps album/playlist links at their first 50 tracks; longer ones are clearly flagged as truncated rather than silently dropping the rest.
-2. Everything missing gets auto-searched on Soulseek right away and the table fills in with each track's best match (quality, size, upload-slot status) — but **nothing downloads yet**. The pick favors whichever good-enough file will arrive soonest: any lossless file or lossy one at 192 kbps or more (128 for Opus/Vorbis) counts as good enough, and among those a free upload slot, a short queue and a fast peer beat extra bitrate.
-3. Review the **Match** column. Don't like a pick (wrong version, low bitrate, no free slot)? Click **Change Match** on that row to see every candidate and pick a different one, or re-run the search with an edited query.
-4. Click **Download All Missing** (or a single row's **Download**) to actually fetch whatever's currently selected per row. Live per-row status, an overall progress bar, and a **Cancel** button for the whole batch. If a source rejects the request or stops sending for three minutes, the row moves on to its next candidate by itself (up to three sources per track); a slow transfer that keeps making progress is left to finish.
-5. Finished downloads get lyrics fetched automatically and appear in the library immediately as each one lands — no need to switch views to see it happened. Once a batch finishes, the editor opens on the first newly-downloaded song, ready to sync.
-6. Rows that failed get a **Retry Search** or **Retry** (download) action, whichever applies. A download retry starts from a source that hasn't failed yet; hover the status to see why each one failed.
+Quality is shown per file. Anything below 192 kbps (128 kbps for Opus and
+OGG) is greyed out.
 
-Typing a plain search instead of pasting a link is for a one-off track outside any playlist: pick a result, and it downloads straight into your library folder and auto-fetches lyrics.
+### Importing from Spotify
+
+Paste a track, album or playlist link into the search box or the
+Playlist page. Tracks already in your library are marked straight away.
+Spotify's public embed page only lists the first 50 tracks of an album or
+playlist, and longer ones are flagged as truncated. The rest are searched
+on Soulseek three at a time, artist and title first, then the title
+alone, then the artist alone, and each row shows how many peers have
+answered. The pick favours any file that is good enough (lossless, or
+lossy at 192 kbps or more, 128 for Opus/Vorbis) and then whichever will
+arrive soonest.
+
+Nothing downloads until you click Download All Missing or a row's
+Download. Download All Missing works as soon as one track is matched, and
+tracks still being searched then download as soon as they're matched.
+Each row shows its download live. If a source rejects the request, never
+answers, stops sending, or keeps the track in its queue for three
+minutes, the row moves on to its next candidate, up to three per track;
+"Other source" does that right away.
+
+### Syncing lyrics
+
+1. Double-click a song in the library. If it has no lyrics, use
+   Get lyrics, or type them in (Enter moves to the next line).
+2. Play it and press S as each line starts, or drag the markers on the
+   timeline.
+3. Save with Ctrl+S.
+
+Help → Keyboard Shortcuts lists every shortcut.
 
 ### Validate Sync
-Tools → Validate Sync samples up to 5 lines spread across the song, extracts a short clip around each one's timestamp, and transcribes it locally with faster-whisper. Each sampled line is checked two ways:
-- **Text**: does the transcription roughly match the lyric line? (fuzzy match, tolerant of ASR mishearing individual words)
-- **Timing**: does detected speech line up with the stamped timestamp?
 
-This is a spot-check, not an audit — it won't catch problems in lines it doesn't sample, and Whisper's own word-level timestamps have a measured ~1s wobble on a clip's very first word, so the timing check is deliberately tuned loose (flagging multi-second drift, not fine-grained accuracy). Treat flagged lines as "worth a listen," not certainties.
-
----
-
-## User Interface
-One window, not separate screens for browsing your library and finding new
-music — a persistent **library panel** on the left, and a **workspace** on
-the right that shows whichever of three things is relevant:
-
-![Screenshot of the working program](Exampleuse1.png)
-
-- **Library panel** (always visible): your song list, color-coded by sync
-  status; a "+ Add Music" menu (Add Files, Find Music); and an overflow
-  (**⋮**) menu for the occasional stuff — Standardize Names, Clear
-  Completed, Fetch Lyrics for All Missing.
-- **The editor**, once you pick a song: playback controls and the karaoke
-  display up top, the timeline below that, then the verse list and its
-  action row (Save, Get Lyrics, Sort Lines, Shift All, Clear All).
-- **The review table**, while a Spotify link is being imported: track,
-  status, and match columns, reviewed and downloaded without ever leaving
-  the library behind.
-- **An empty state**, when nothing's loaded yet, inviting you to select a
-  song or add music rather than showing a blank editor shell.
-
----
+Tools → Validate Sync samples up to 5 lines spread across the song,
+extracts a short clip around each one's timestamp and transcribes it
+locally with faster-whisper. Each line is checked for text (a fuzzy match
+that tolerates misheard words) and for timing (does speech start near the
+timestamp?). It is a spot-check and won't catch problems in lines it
+doesn't sample. Whisper's word timestamps wobble by about a second on a
+clip's first word, so the timing check only flags multi-second drift.
 
 ## Development
 
-The `utils.py` timestamp/LRC-parsing helpers have a test suite (Qt-free, so no display is needed to run it):
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
----
+The tests run without a display (Qt's offscreen platform) and never touch
+your real settings or library. The format conversion tests need `ffmpeg`.
 
 ## Roadmap
+
 - Waveform rendering in the timeline
-- Official Spotify Web API support (for albums/playlists over 50 tracks, if you're willing to register a developer app)
+- Official Spotify Web API support, for albums and playlists over 50 tracks
 
 ## License
 
