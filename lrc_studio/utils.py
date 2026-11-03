@@ -107,6 +107,17 @@ def parse_lrc_timestamp(ts: str) -> int:
 # LRC file analysis
 # ---------------------------------------------------------------------------
 
+def lrc_status_key(lrc_path: str) -> str:
+    """"synced" | "plain" | "missing" — the same verdict as
+    ``analyze_lrc_status``, as a plain string for icons and filters."""
+    color = analyze_lrc_status(lrc_path)
+    if color == COLOR_SYNCED:
+        return "synced"
+    if color == COLOR_UNSYNCED:
+        return "plain"
+    return "missing"
+
+
 def analyze_lrc_status(lrc_path: str) -> QColor:
     """Return a status colour reflecting the quality of *lrc_path*.
 
@@ -188,7 +199,7 @@ def parse_lrc_file(text: str) -> tuple[list[tuple[str, str]], int]:
 
 # Extensions we know how to embed lyrics into, each with a different
 # underlying tag format (ID3 USLT, Vorbis comment, MP4 atom).
-EMBEDDABLE_EXTENSIONS: tuple[str, ...] = (".mp3", ".flac", ".ogg", ".m4a", ".mp4")
+EMBEDDABLE_EXTENSIONS: tuple[str, ...] = (".mp3", ".flac", ".ogg", ".opus", ".m4a", ".mp4")
 
 
 def write_embedded_lyrics(file_path: str, lrc_text: str) -> None:
@@ -221,6 +232,12 @@ def write_embedded_lyrics(file_path: str, lrc_text: str) -> None:
     elif ext == ".ogg":
         from mutagen.oggvorbis import OggVorbis
         audio = OggVorbis(file_path)
+        audio["LYRICS"] = lrc_text
+        audio.save()
+
+    elif ext == ".opus":
+        from mutagen.oggopus import OggOpus
+        audio = OggOpus(file_path)
         audio["LYRICS"] = lrc_text
         audio.save()
 
