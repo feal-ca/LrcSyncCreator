@@ -1,87 +1,126 @@
-"""dialogs.py — secondary dialog windows: Settings and the Soulseek search
-picker. Kept separate from ``widgets.py`` (custom-painted, always-visible
-widgets) and ``app.py`` (orchestration) to keep each file's job obvious.
+"""dialogs.py — secondary windows: Settings, the "Change match" picker
+for the Spotify review, the lyrics picker, and Validate Sync's report.
+Kept apart from ``widgets.py`` (always-visible custom widgets) and
+``app.py`` (orchestration) to keep each file's job obvious.
 """
 
 from __future__ import annotations
 
-import os
 
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, Qt
 from PyQt6.QtWidgets import (
-    QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QProgressBar, QPushButton,
-    QVBoxLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QPlainTextEdit, QProgressBar, QPushButton,
+    QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
-from constants import COLOR_MISSING, COLOR_SYNCED, COLOR_UNSYNCED
+import theme
+from constants import COLOR_DANGER, COLOR_SYNCED, COLOR_UNSYNCED
+from postprocess import DEFAULT_SLSKD_DOWNLOADS, _as_bool
 from soulseek import SlskdClient, SoulseekFile
 
 
+def _section(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setProperty("role", "heading")
+    return label
+
+
 class SettingsDialog(QDialog):
-    """slskd connection details + the local library folder new downloads land in."""
+    """slskd connection, where music goes, and what happens to downloads."""
 
     def __init__(self, settings: QSettings, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(440)
+        self.setMinimumWidth(560)
         self._settings = settings
 
-        form = QFormLayout()
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
 
-        self.slskd_url = QLineEdit(str(settings.value("slskd_url", "http://127.0.0.1:5030")))
-        form.addRow("slskd URL:", self.slskd_url)
-
-        self.slskd_api_key = QLineEdit(str(settings.value("slskd_api_key", "")))
-        self.slskd_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("slskd API key:", self.slskd_api_key)
-
-        test_row = QHBoxLayout()
-        self.test_button = QPushButton("Test Connection")
-        self.test_button.clicked.connect(self._test_connection)
-        self.test_status = QLabel(
-            "Run ./scripts/setup_slskd.sh once — LRC Studio starts slskd itself after that"
-        )
-        self.test_status.setWordWrap(True)
-        test_row.addWidget(self.test_button)
-        test_row.addWidget(self.test_status, stretch=1)
-        form.addRow("", test_row)
-
-        default_slskd_downloads = os.path.normpath(
-            os.path.join(os.path.dirname(__file__), "..", "slskd-bin", "downloads")
-        )
-        dl_row = QHBoxLayout()
-        self.slskd_downloads_dir = QLineEdit(
-            str(settings.value("slskd_downloads_dir", default_slskd_downloads))
-        )
-        dl_browse_btn = QPushButton("Browse…")
-        dl_browse_btn.clicked.connect(self._browse_slskd_downloads)
-        dl_row.addWidget(self.slskd_downloads_dir, stretch=1)
-        dl_row.addWidget(dl_browse_btn)
-        form.addRow("slskd's downloads folder:", dl_row)
-
+        layout.addWidget(_section("Library"))
+        lib_form = QFormLayout()
         lib_row = QHBoxLayout()
         self.library_dir = QLineEdit(str(settings.value("library_dir", "")))
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_library)
         lib_row.addWidget(self.library_dir, stretch=1)
         lib_row.addWidget(browse_btn)
-        form.addRow("Move finished downloads to:", lib_row)
+        lib_form.addRow("Music folder:", lib_row)
+        layout.addLayout(lib_form)
+        lib_hint = QLabel("Shown in the library on startup. Finished downloads are moved here.")
+        lib_hint.setProperty("role", "faint")
+        layout.addWidget(lib_hint)
+
+        layout.addSpacing(6)
+        layout.addWidget(_section("Downloads"))
+        self.convert_check = QCheckBox("Convert lossless downloads (FLAC, WAV, ALAC) to Opus")
+        self.convert_check.setChecked(_as_bool(settings.value("convert_lossless", True), True))
+        self.bitrate_combo = QComboBox()
+        for kbps in (128, 160, 192, 256):
+            self.bitrate_combo.addItem(f"{kbps} kbps", kbps)
+        current = int(settings.value("opus_bitrate", 192) or 192)
+        self.bitrate_combo.setCurrentIndex(max(0, self.bitrate_combo.findData(current)))
+        conv_row = QHBoxLayout()
+        conv_row.addWidget(self.convert_check)
+        conv_row.addStretch(1)
+        conv_row.addWidget(self.bitrate_combo)
+        layout.addLayout(conv_row)
+        conv_hint = QLabel(
+            "Tags and cover art are kept and the original is deleted once the Opus file checks out. "
+            "MP3 and other lossy files are never re-encoded."
+        )
+        conv_hint.setWordWrap(True)
+        conv_hint.setProperty("role", "faint")
+        layout.addWidget(conv_hint)
+        self.rename_check = QCheckBox("Rename downloads to “Artist - Title” from their tags")
+        self.rename_check.setChecked(_as_bool(settings.value("rename_downloads", True), True))
+        layout.addWidget(self.rename_check)
+        self.embed_check = QCheckBox("Also write fetched lyrics into the audio file's tags")
+        self.embed_check.setChecked(_as_bool(settings.value("embed_lyrics", False), False))
+        layout.addWidget(self.embed_check)
+
+        layout.addSpacing(6)
+        layout.addWidget(_section("Soulseek (slskd)"))
+        form = QFormLayout()
+        self.slskd_url = QLineEdit(str(settings.value("slskd_url", "http://127.0.0.1:5030")))
+        form.addRow("slskd URL:", self.slskd_url)
+        self.slskd_api_key = QLineEdit(str(settings.value("slskd_api_key", "")))
+        self.slskd_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("API key:", self.slskd_api_key)
+        dl_row = QHBoxLayout()
+        self.slskd_downloads_dir = QLineEdit(
+            str(settings.value("slskd_downloads_dir", "") or DEFAULT_SLSKD_DOWNLOADS)
+        )
+        dl_browse_btn = QPushButton("Browse…")
+        dl_browse_btn.clicked.connect(self._browse_slskd_downloads)
+        dl_row.addWidget(self.slskd_downloads_dir, stretch=1)
+        dl_row.addWidget(dl_browse_btn)
+        form.addRow("slskd's downloads folder:", dl_row)
+        layout.addLayout(form)
+        test_row = QHBoxLayout()
+        self.test_button = QPushButton("Test connection")
+        self.test_button.clicked.connect(self._test_connection)
+        test_row.addWidget(self.test_button)
+        test_row.addStretch(1)
+        layout.addLayout(test_row)
+        self.test_status = QLabel("Run ./scripts/setup_slskd.sh once. LRC Studio starts slskd by itself after that.")
+        self.test_status.setWordWrap(True)
+        self.test_status.setProperty("role", "faint")
+        layout.addWidget(self.test_status)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setProperty("variant", "primary")
         buttons.accepted.connect(self._save)
         buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
+        layout.addSpacing(6)
         layout.addWidget(buttons)
 
     def _browse_library(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(
-            self, "Choose Library Folder", self.library_dir.text()
-        )
+        chosen = QFileDialog.getExistingDirectory(self, "Choose Music Folder", self.library_dir.text())
         if chosen:
             self.library_dir.setText(chosen)
 
@@ -96,57 +135,72 @@ class SettingsDialog(QDialog):
         client = SlskdClient(self.slskd_url.text().strip(), self.slskd_api_key.text().strip())
         ok, msg = client.check_connection()
         self.test_status.setText(msg)
-        self.test_status.setStyleSheet(f"color: {(COLOR_SYNCED if ok else COLOR_MISSING).name()};")
+        self.test_status.setStyleSheet(f"color: {(COLOR_SYNCED if ok else COLOR_DANGER).name()};")
 
     def _save(self) -> None:
-        self._settings.setValue("slskd_url", self.slskd_url.text().strip())
-        self._settings.setValue("slskd_api_key", self.slskd_api_key.text().strip())
-        self._settings.setValue("slskd_downloads_dir", self.slskd_downloads_dir.text().strip())
-        self._settings.setValue("library_dir", self.library_dir.text().strip())
+        s = self._settings
+        s.setValue("slskd_url", self.slskd_url.text().strip())
+        s.setValue("slskd_api_key", self.slskd_api_key.text().strip())
+        s.setValue("slskd_downloads_dir", self.slskd_downloads_dir.text().strip())
+        s.setValue("library_dir", self.library_dir.text().strip())
+        s.setValue("convert_lossless", self.convert_check.isChecked())
+        s.setValue("opus_bitrate", int(self.bitrate_combo.currentData()))
+        s.setValue("rename_downloads", self.rename_check.isChecked())
+        s.setValue("embed_lyrics", self.embed_check.isChecked())
         self.accept()
 
 
 class SoulseekSearchDialog(QDialog):
-    """Search Soulseek (via slskd) and let the user pick one result to download.
+    """Pick one Soulseek result: the Spotify review's "Change match".
 
-    Purely a picker — searching and the actual download are driven by the
-    caller via ``SoulseekSearchThread``/``SoulseekDownloadThread`` so this
-    dialog never blocks the UI thread itself.
+    Search by title, narrow with the filter (prefilled with the artist),
+    pick a row. Purely a picker: the caller runs the search thread and
+    feeds results in, so this dialog never blocks the UI thread itself.
     """
 
-    def __init__(self, query: str, parent=None) -> None:
+    def __init__(self, query: str, parent=None, filter_text: str = "") -> None:
+        from search_view import SearchResultsWidget
+
         super().__init__(parent)
-        self.setWindowTitle("Find on Soulseek")
-        self.setMinimumSize(600, 420)
+        self.setWindowTitle("Change match")
+        self.resize(980, 560)
         self.selected_file: SoulseekFile | None = None
-        self._results: list[SoulseekFile] = []
 
         layout = QVBoxLayout(self)
+        layout.setSpacing(8)
 
         search_row = QHBoxLayout()
         self.query_input = QLineEdit(query)
-        self.search_button = QPushButton("Search")
+        self.query_input.setProperty("variant", "search")
+        self.search_button = QPushButton("Search again")
         search_row.addWidget(self.query_input, stretch=1)
         search_row.addWidget(self.search_button)
         layout.addLayout(search_row)
+        self.query_input.returnPressed.connect(self.search_button.click)
 
-        self.status_label = QLabel("Enter a search and press Search.")
+        self.status_label = QLabel("")
+        self.status_label.setProperty("role", "muted")
         layout.addWidget(self.status_label)
 
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0)   # indeterminate — we don't know peer response count in advance
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
-        self.progress_bar.setTextVisible(False)
-        self.progress_bar.setMaximumHeight(6)
+        self.progress_bar.setFixedHeight(3)
         layout.addWidget(self.progress_bar)
 
-        self.result_list = QListWidget()
-        layout.addWidget(self.result_list, stretch=1)
+        self.results = SearchResultsWidget(show_folder_action=False)
+        self.results.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.results.activated.connect(lambda files: self._accept_file(files[0]))
+        if filter_text:
+            self.results.set_filter_text(filter_text)
+        layout.addWidget(self.results, stretch=1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Download Selected")
+        ok = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setText("Use this file")
+        ok.setProperty("variant", "primary")
         buttons.accepted.connect(self._accept_selected)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -156,31 +210,243 @@ class SoulseekSearchDialog(QDialog):
         self.query_input.setEnabled(not is_searching)
         self.progress_bar.setVisible(is_searching)
         if is_searching:
-            self.status_label.setText("Searching Soulseek… (waiting for peer responses)")
-            self.result_list.clear()
+            self.status_label.setText("Searching Soulseek… (waiting for peers to answer)")
+            self.results.set_results([])
 
     def show_results(self, results: list[SoulseekFile]) -> None:
-        self._results = results
-        self.result_list.clear()
+        self.results.set_results(results)
         if not results:
-            self.status_label.setText("No results.")
+            self.status_label.setText("No results. Try just the title, or just the artist.")
             return
-        self.status_label.setText(f"{len(results)} result(s) — best matches first.")
-        for f in results:
-            item = QListWidgetItem(f"{f.display_name}   [{f.quality_label}]   from {f.username}")
-            item.setToolTip(f.filename)
-            self.result_list.addItem(item)
+        shown = self.results.visible_count()
+        extra = f", {shown} match the filter" if shown != len(results) else ""
+        self.status_label.setText(f"{len(results)} results{extra}. Best candidates first.")
+        self.results.select_first()
 
     def show_error(self, message: str) -> None:
         self.status_label.setText(f"Search failed: {message}")
 
+    def _accept_file(self, f: SoulseekFile) -> None:
+        self.selected_file = f
+        self.accept()
+
     def _accept_selected(self) -> None:
-        row = self.result_list.currentRow()
-        if 0 <= row < len(self._results):
-            self.selected_file = self._results[row]
-            self.accept()
+        files = self.results.selected_files()
+        if files:
+            self._accept_file(files[0])
         else:
             self.status_label.setText("Select a result first.")
+
+
+class LyricsPickerDialog(QDialog):
+    """Get Lyrics: look the song up, compare candidates, preview, choose.
+
+    Candidates come from LRCLIB ranked by how well title, artist and
+    duration match the loaded file; the length column shows the
+    difference from the real track, which is the quickest tell for a
+    live cut or a different edit. "Other sources" runs the older
+    multi-provider search for songs LRCLIB doesn't have.
+    """
+
+    def __init__(self, artist: str, title: str, duration_s: float | None, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Get lyrics")
+        self.resize(940, 580)
+        self.chosen_text: str = ""
+        self._duration_s = duration_s
+        self._candidates: list = []
+        self._threads: list = []
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        row = QHBoxLayout()
+        self.artist_input = QLineEdit(artist)
+        self.artist_input.setPlaceholderText("Artist")
+        self.title_input = QLineEdit(title)
+        self.title_input.setPlaceholderText("Title")
+        self.search_button = QPushButton("Search")
+        self.search_button.setProperty("variant", "primary")
+        self.search_button.clicked.connect(self.run_search)
+        self.other_button = QPushButton("Other sources")
+        self.other_button.setToolTip("Musixmatch, NetEase and others, first match only")
+        self.other_button.clicked.connect(self.run_other_sources)
+        for w in (self.artist_input, self.title_input):
+            w.returnPressed.connect(self.run_search)
+        row.addWidget(self.artist_input, stretch=2)
+        row.addWidget(self.title_input, stretch=3)
+        row.addWidget(self.search_button)
+        row.addWidget(self.other_button)
+        layout.addLayout(row)
+
+        self.status_label = QLabel("")
+        self.status_label.setProperty("role", "muted")
+        layout.addWidget(self.status_label)
+
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Song", "Album", "Length", "Timing"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setShowGrid(False)
+        header = self.table.horizontalHeader()
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(1, 150)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self._preview_selected)
+        self.table.itemDoubleClicked.connect(lambda _i: self._accept_selected())
+        split.addWidget(self.table)
+
+        self.preview = QPlainTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setFont(theme.mono_font(9.5))
+        self.preview.setPlaceholderText("Pick a result to preview its lyrics.")
+        split.addWidget(self.preview)
+        split.setSizes([560, 380])
+        layout.addWidget(split, stretch=1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self.use_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.use_button.setText("Use these lyrics")
+        self.use_button.setProperty("variant", "primary")
+        self.use_button.setEnabled(False)
+        buttons.accepted.connect(self._accept_selected)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    # -- searching ---------------------------------------------------------
+
+    def run_search(self) -> None:
+        from workers import LyricsCandidatesThread
+
+        artist, title = self.artist_input.text().strip(), self.title_input.text().strip()
+        if not title:
+            self.status_label.setText("Enter at least a title.")
+            return
+        self.status_label.setText("Searching LRCLIB…")
+        self.search_button.setEnabled(False)
+        thread = LyricsCandidatesThread(artist, title, self._duration_s)
+        thread.results_ready.connect(self._show_candidates)
+        thread.failed.connect(lambda msg: self._search_done(f"Search failed: {msg}"))
+        self._threads.append(thread)
+        thread.start()
+
+    def run_other_sources(self) -> None:
+        from workers import LyricsSearchThread
+
+        query = f"{self.title_input.text().strip()} {self.artist_input.text().strip()}".strip()
+        if not query:
+            return
+        self.status_label.setText("Searching other sources…")
+        self.other_button.setEnabled(False)
+        thread = LyricsSearchThread(query)
+        thread.result_ready.connect(self._show_other_result)
+        self._threads.append(thread)
+        thread.start()
+
+    def _search_done(self, message: str) -> None:
+        self.search_button.setEnabled(True)
+        self.other_button.setEnabled(True)
+        self.status_label.setText(message)
+
+    def _show_candidates(self, candidates: list) -> None:
+        self._candidates = [c for c in candidates if c.text.strip()]
+        self.table.setRowCount(0)
+        for c in self._candidates:
+            self._append_candidate(c)
+        if self._candidates:
+            synced = sum(1 for c in self._candidates if c.has_synced)
+            self._search_done(
+                f"{len(self._candidates)} results, {synced} with synced timing. Closest match first."
+            )
+            self.table.selectRow(0)
+        else:
+            self._search_done("LRCLIB has nothing for this. Try Other sources, or fix the title.")
+
+    def _show_other_result(self, text: str) -> None:
+        from lyrics_fetch import LyricsCandidate, is_plausible_synced
+
+        if not text.strip():
+            self._search_done("Other sources found nothing either.")
+            return
+        synced = is_plausible_synced(text, self._duration_s)
+        cand = LyricsCandidate(
+            source="other", artist=self.artist_input.text().strip(),
+            title=self.title_input.text().strip(), album="", duration_s=None,
+            synced=text if synced else None, plain=None if synced else text,
+        )
+        self._candidates.insert(0, cand)
+        self.table.insertRow(0)
+        self._fill_row(0, cand)
+        self.table.selectRow(0)
+        self._search_done("Found a match on another source (shown first).")
+
+    def _append_candidate(self, c) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self._fill_row(row, c)
+
+    def _fill_row(self, row: int, c) -> None:
+        song = QTableWidgetItem(f"{c.artist} - {c.title}" if c.artist else c.title)
+        song.setToolTip(f"Source: {c.source}")
+        album = QTableWidgetItem(c.album)
+        album.setForeground(theme_color(theme.TEXT_2))
+        if c.duration_s:
+            m, s = divmod(int(round(c.duration_s)), 60)
+            length_text = f"{m}:{s:02d}"
+            if self._duration_s:
+                diff = c.duration_s - self._duration_s
+                if abs(diff) >= 1:
+                    length_text += f"  ({diff:+.0f}s)"
+            length = QTableWidgetItem(length_text)
+            if self._duration_s and abs(c.duration_s - self._duration_s) > 3:
+                length.setForeground(theme_color(theme.DANGER))
+        else:
+            length = QTableWidgetItem("")
+        timing = QTableWidgetItem("Synced" if c.has_synced else "Text only")
+        timing.setForeground(theme_color(theme.OK if c.has_synced else theme.PLAIN))
+        for col, item in enumerate((song, album, length, timing)):
+            self.table.setItem(row, col, item)
+
+    def _preview_selected(self) -> None:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._candidates):
+            self.preview.setPlainText(self._candidates[row].text)
+            self.use_button.setEnabled(True)
+        else:
+            self.preview.clear()
+            self.use_button.setEnabled(False)
+
+    def _accept_selected(self) -> None:
+        row = self.table.currentRow()
+        if 0 <= row < len(self._candidates):
+            self.chosen_text = self._candidates[row].text
+            self.accept()
+
+    def done(self, result: int) -> None:  # noqa: D401 — QDialog override
+        # A lookup still in flight finishes on its own; just keep its
+        # QThread object alive until then instead of killing a request.
+        for thread in self._threads:
+            if thread.isRunning():
+                _LINGERING.add(thread)
+                thread.finished.connect(lambda t=thread: _LINGERING.discard(t))
+        super().done(result)
+
+
+_LINGERING: set = set()
+
+
+def theme_color(hex_color: str):
+    from PyQt6.QtGui import QColor
+    return QColor(hex_color)
 
 
 class ValidateSyncDialog(QDialog):
@@ -200,8 +466,8 @@ class ValidateSyncDialog(QDialog):
     _VERDICT_COLORS = {
         "ok": COLOR_SYNCED,
         "timing_drift": COLOR_UNSYNCED,
-        "text_mismatch": COLOR_MISSING,
-        "no_audio_match": COLOR_MISSING,
+        "text_mismatch": COLOR_DANGER,
+        "no_audio_match": COLOR_DANGER,
     }
 
     def __init__(self, parent=None) -> None:

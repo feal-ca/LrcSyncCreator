@@ -30,28 +30,21 @@ import vlc
 from PyQt6.QtCore import Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QHBoxLayout,
+    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QScrollArea, QSlider, QSplitter, QStackedWidget, QTabBar, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from constants import (
     AUDIO_EXTENSIONS,
-    COLOR_ACCENT,
-    COLOR_BG,
-    COLOR_FG,
-    COLOR_MISSING,
-    COLOR_MUTED,
-    COLOR_SYNCED,
-    COLOR_UNSYNCED,
     DEFAULT_TIMESTAMP,
     MAX_UNDO,
     POLL_INTERVAL_MS,
     SYNC_OFFSET_MS,
 )
 from utils import (
-    analyze_lrc_status,
     format_ms,
     ms_to_lrc_timestamp,
     parse_lrc_file,
@@ -59,18 +52,20 @@ from utils import (
     write_embedded_lyrics,
 )
 import lyrics_qa
-from dialogs import SettingsDialog, SoulseekSearchDialog, ValidateSyncDialog
+import theme
+from dialogs import LyricsPickerDialog, SettingsDialog, ValidateSyncDialog
 from download_view import DownloadView
-from library_panel import LibraryPanel
-from soulseek import SlskdClient, SoulseekFile
+from library_panel import LibraryPanel, scan_audio_files
+from postprocess import _as_bool
+from search_view import SearchView
+from soulseek import SlskdClient
 from spotify_playlist import is_spotify_link
+from transfers_view import TransfersView
 from widgets import TimelineWidget, Verse
 from workers import (
+    LibraryConvertThread,
     LyricsDownloaderThread,
     LyricsQAThread,
-    LyricsSearchThread,
-    SoulseekDownloadThread,
-    SoulseekSearchThread,
     stop_thread,
 )
 
@@ -96,8 +91,18 @@ class _Command:
 
 # Pages of the main window's workspace stack (see LrcSyncApp._init_ui).
 WORKSPACE_EDITOR = 0
-WORKSPACE_ACQUIRE = 1
+WORKSPACE_ACQUIRE = 1      # Spotify playlist review
 WORKSPACE_EMPTY = 2
+WORKSPACE_SEARCH = 3
+WORKSPACE_TRANSFERS = 4
+
+# Tabs above the workspace, in order.
+TAB_EDITOR, TAB_SEARCH, TAB_DOWNLOADS, TAB_PLAYLIST = range(4)
+_PAGE_TO_TAB = {
+    WORKSPACE_EDITOR: TAB_EDITOR, WORKSPACE_EMPTY: TAB_EDITOR,
+    WORKSPACE_SEARCH: TAB_SEARCH, WORKSPACE_TRANSFERS: TAB_DOWNLOADS,
+    WORKSPACE_ACQUIRE: TAB_PLAYLIST,
+}
 
 
 class LrcSyncApp(QMainWindow):
@@ -134,12 +139,12 @@ class LrcSyncApp(QMainWindow):
 
         # Batch downloader thread reference (kept to avoid GC)
         self._downloader: LyricsDownloaderThread | None = None
-        # Manual "Web Search" thread reference (kept to avoid GC)
-        self._search_thread: LyricsSearchThread | None = None
-        # Soulseek search/download thread references (kept to avoid GC)
-        self._soulseek_search_thread: SoulseekSearchThread | None = None
-        self._soulseek_download_thread: SoulseekDownloadThread | None = None
+        # Files waiting for a lyrics pass while one is already running —
+        # a second batch queues here instead of replacing (and orphaning)
+        # the running thread.
+        self._lyrics_pending: list[str] = []
         self._qa_thread: LyricsQAThread | None = None
+        self._convert_thread: LibraryConvertThread | None = None
         # slskd process we spawned ourselves (None if the user is running
         # their own instance, or we haven't tried to start one yet) — only
         # ever terminated on app exit if we're the one who started it.
@@ -185,10 +190,12 @@ class LrcSyncApp(QMainWindow):
         if state == vlc.State.Ended:
             if not self._ended_handled:
                 self._ended_handled = True
-                row = self.library_panel.current_row()
-                if row < self.library_panel.row_count() - 1:
-                    self._load_file_from_index(row + 1)
-                    QTimer.singleShot(300, self.player.play)
+                nxt = self.library_panel.next_path(self.current_file_path)
+                # Never auto-advance away from unsaved edits.
+                if nxt and not self._dirty:
+                    self._load_song(nxt, show_editor=False)
+                    self.library_panel.select_path(nxt)
+                    QTimer.singleShot(300, self._play)
                 else:
                     self.play_pause_btn.setText("▶")
             return
@@ -282,7 +289,7 @@ class LrcSyncApp(QMainWindow):
 
     def _init_ui(self) -> None:
         self.setWindowTitle("LRC Studio")
-        self.resize(1200, 850)
+        self.resize(1280, 860)
         self.setAcceptDrops(True)
 
         self._commands = self._build_commands()
@@ -291,43 +298,53 @@ class LrcSyncApp(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(15, 15, 15, 15)
-        root_layout.setSpacing(10)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
 
-        root_layout.addLayout(self._build_top_bar())
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(14, 10, 14, 6)
+        body_layout.setSpacing(6)
 
-        # ── Karaoke display ───────────────────────────────────────────
-        self.karaoke_label = QLabel("Waiting for song…")
-        self.karaoke_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.karaoke_label.setStyleSheet(
-            f"font-size: 26px; font-weight: bold; color: {COLOR_UNSYNCED.name()};"
-            " padding: 15px; background-color: #11111b;"
-            " border-radius: 10px; border: 1px solid #313244;"
-        )
-        self.karaoke_label.setFixedHeight(80)
-        root_layout.addWidget(self.karaoke_label)
-
-        # ── Timeline ──────────────────────────────────────────────────
-        self.timeline = TimelineWidget()
-        self.timeline.setMouseTracking(True)
-        self.timeline.time_changed_bulk.connect(self._update_verses_from_timeline)
-        self.timeline.seek_requested.connect(self.set_position)
-        root_layout.addWidget(self.timeline)
-
-        # ── Splitter: library panel | workspace ─────────────────────────
+        # ── Splitter: library panel | tabs + workspace ────────────────
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
         self.library_panel = LibraryPanel(self.settings)
+        self.library_panel.setMinimumWidth(240)
         self.library_panel.song_selected.connect(self._on_library_song_selected)
         self.library_panel.file_renamed.connect(self._on_file_renamed)
         self.library_panel.find_music_requested.connect(self._find_music)
         self.library_panel.fetch_missing_lyrics_requested.connect(self._batch_download_lyrics)
+        self.library_panel.convert_library_requested.connect(self._convert_library)
         self.splitter.addWidget(self.library_panel)
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        self.tabs = QTabBar()
+        self.tabs.setDrawBase(False)
+        self.tabs.setExpanding(False)
+        for label in ("Editor", "Search", "Downloads", "Playlist"):
+            self.tabs.addTab(label)
+        self.tabs.setTabToolTip(TAB_SEARCH, "Search Soulseek (Ctrl+F)")
+        self.tabs.setTabToolTip(TAB_PLAYLIST, "Import a Spotify track, album or playlist")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        right_layout.addWidget(self.tabs)
 
         self.workspace = QStackedWidget()
         self.workspace.addWidget(self._build_lyrics_panel())      # WORKSPACE_EDITOR = 0
 
+        # The one download engine; the Playlist page feeds it too.
+        self.transfers_view = TransfersView(self.settings, lambda: self._get_slskd_client(), self)
+        self.transfers_view.file_ready.connect(self._on_transfer_ready)
+        self.transfers_view.active_count_changed.connect(self._on_active_downloads_changed)
+        self.transfers_view.open_requested.connect(self._open_in_library)
+
         self.download_view = DownloadView(
-            self.settings, self._get_slskd_client, self._collect_library_paths, self,
+            self.settings, lambda: self._get_slskd_client(), self._collect_library_paths, self,
+            transfers=self.transfers_view,
         )
         self.download_view.files_ready.connect(self._on_download_files_ready)
         self.download_view.file_downloaded.connect(self.library_panel.add_files_single)
@@ -336,56 +353,80 @@ class LrcSyncApp(QMainWindow):
 
         self.workspace.addWidget(self._build_empty_state())         # WORKSPACE_EMPTY = 2
 
-        self.splitter.addWidget(self.workspace)
+        # Lambdas rather than bound methods so a test (or a later
+        # override) replacing these on the instance is honoured.
+        self.search_view = SearchView(
+            self.settings, lambda: self._get_slskd_client(), is_spotify_link, self,
+        )
+        self.search_view.spotify_link_entered.connect(lambda link: self._open_batch_import(link))
+        self.search_view.download_requested.connect(self._queue_downloads)
+        self.workspace.addWidget(self.search_view)                  # WORKSPACE_SEARCH = 3
+
+        self.workspace.addWidget(self.transfers_view)               # WORKSPACE_TRANSFERS = 4
+
+        self.workspace.currentChanged.connect(self._sync_tab_to_page)
+        right_layout.addWidget(self.workspace, stretch=1)
+
+        self.splitter.addWidget(right)
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 3)
-        root_layout.addWidget(self.splitter, stretch=1)
+        self.splitter.setSizes([320, 960])
+        body_layout.addWidget(self.splitter, stretch=1)
 
-        # ── Status bar ────────────────────────────────────────────────
+        # ── Status line ───────────────────────────────────────────────
         self.status_bar = QLabel("Ready")
-        self.status_bar.setStyleSheet("font-size: 11px; color: #a6adc8;")
-
+        self.status_bar.setProperty("role", "faint")
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setFixedSize(180, 4)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet(
-            f"QProgressBar::chunk {{ background-color: {COLOR_SYNCED.name()}; }}"
-        )
-
         stat_row = QHBoxLayout()
-        stat_row.addWidget(self.status_bar)
+        stat_row.addWidget(self.status_bar, stretch=1)
         stat_row.addWidget(self.progress_bar)
-        root_layout.addLayout(stat_row)
+        body_layout.addLayout(stat_row)
+
+        root_layout.addWidget(body, stretch=1)
+        root_layout.addWidget(self._build_player_bar())
 
         self.workspace.setCurrentIndex(WORKSPACE_EMPTY)
+        QTimer.singleShot(0, self._load_library)
 
     def _build_empty_state(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(2)
 
-        label = QLabel("Select a song from your library, or add music to get started.")
-        label.setStyleSheet(f"color: {COLOR_MUTED.name()}; font-size: 14px;")
+        title = QLabel("Pick a song to sync")
+        title.setProperty("role", "title")
+        layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignHCenter)
+        label = QLabel(
+            "Double-click a song in your library to open it here.\n"
+            "Hollow dots are songs without lyrics yet."
+        )
+        label.setProperty("role", "muted")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
+        layout.addSpacing(4)
+        layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignHCenter)
+        layout.addSpacing(14)
 
         # Shares the sidebar's own QMenu object (Add Files / Find Music)
         # rather than a second, hand-built equivalent — the two can never
         # drift apart, and a zero-state user with local files still has
         # "Add Files" reachable from here, not just Find Music.
         self._empty_state_add_music_button = QToolButton()
-        self._empty_state_add_music_button.setText("+ Add Music")
+        self._empty_state_add_music_button.setText("Add music")
+        self._empty_state_add_music_button.setProperty("variant", "primary")
         self._empty_state_add_music_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._empty_state_add_music_button.setMenu(self.library_panel.add_music_button.menu())
-        self._empty_state_add_music_button.setStyleSheet(self._primary_button_style())
         layout.addWidget(self._empty_state_add_music_button, alignment=Qt.AlignmentFlag.AlignCenter)
-
+        layout.addStretch(3)
         return page
 
     def _on_download_files_ready(self, paths: list[str]) -> None:
+        # Each file already joined the library and got its lyrics queued
+        # as it landed (see _on_transfer_ready); this is the end-of-batch
+        # step: open the first new song.
         self.library_panel.add_files(paths)
-        self._fetch_lyrics_for(paths)
         # Only auto-jump to the new song when it's safe: switching away
         # from unsaved sync edits on whatever's currently loaded would
         # silently discard them, with no confirmation, since this runs
@@ -427,16 +468,23 @@ class LrcSyncApp(QMainWindow):
             # (it's constructed later in _init_ui) — lazy lookup via lambda.
             _Command("Add Files…", "Ctrl+O", lambda: self.library_panel.open_add_files_dialog(), "file"),
             _Command("Save LRC", "Ctrl+S", self._save_lrc_file, "file"),
+            _Command("Rescan Library Folder", None, self._load_library, "file"),
             _Command("Exit", "Ctrl+Q", self.close, "file", separator_before=True),
 
             _Command("Undo Sync", "Ctrl+Z", self._undo_last_sync, "edit"),
             _Command("Sort Lines by Time", "Ctrl+T", self._sort_verses_by_time, "edit"),
             _Command("Shift All Timestamps…", "Ctrl+Shift+O", self._shift_all_timestamps, "edit"),
+            _Command("Get Lyrics…", "Ctrl+L", self._get_lyrics_online, "edit"),
             _Command("Clear All Lyrics", None, self._clear_lyrics, "edit", separator_before=True),
 
             _Command("Find Music…", "Ctrl+F", self._find_music, "tools"),
+            _Command("Downloads", "Ctrl+J", lambda: self._show_page(WORKSPACE_TRANSFERS), "tools"),
+            _Command("Fetch Lyrics for All Missing", None,
+                     lambda: self._batch_download_lyrics(self.library_panel.paths_with_status("missing")), "tools",
+                     separator_before=True),
+            _Command("Convert Lossless Files to Opus…", None, self._convert_library, "tools"),
             _Command("Validate Sync…", None, self._validate_sync, "tools"),
-            _Command("Settings…", None, self._open_settings_dialog, "tools", separator_before=True),
+            _Command("Settings…", "Ctrl+,", self._open_settings_dialog, "tools", separator_before=True),
 
             _Command("Keyboard Shortcuts…", None, self._show_shortcuts_dialog, "help"),
             _Command("About LRC Studio", None, self._show_about_dialog, "help"),
@@ -487,62 +535,58 @@ class LrcSyncApp(QMainWindow):
             "Built with PyQt6 and VLC.",
         )
 
-    def _build_top_bar(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setSpacing(15)
+    def _build_player_bar(self) -> QFrame:
+        """The transport, docked along the bottom of the window so it stays
+        reachable from every page (preview a download while searching)."""
+        bar = QFrame()
+        bar.setObjectName("PlayerBar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(16, 10, 16, 10)
+        row.setSpacing(12)
 
-        # Play/pause button
         self.play_pause_btn = QPushButton("▶")
-        self.play_pause_btn.setFixedSize(45, 45)
+        self.play_pause_btn.setFixedSize(38, 38)
+        self.play_pause_btn.setProperty("variant", "round")
+        self.play_pause_btn.setToolTip("Play / pause (Space)")
         self.play_pause_btn.clicked.connect(self._toggle_play_pause)
-        self.play_pause_btn.setStyleSheet(
-            f"background-color: {COLOR_ACCENT.name()}; color: #1e1e2e;"
-            " border-radius: 22px; font-size: 20px; font-weight: bold;"
-        )
 
-        # Time labels
-        self.lbl_curr = QLabel("00:00")
-        self.lbl_tot  = QLabel("00:00")
+        self.lbl_curr = QLabel("0:00")
+        self.lbl_tot  = QLabel("0:00")
         for lbl in (self.lbl_curr, self.lbl_tot):
-            lbl.setStyleSheet(
-                "font-family: monospace; font-size: 14px;"
-                " font-weight: bold; color: #cdd6f4;"
-            )
+            lbl.setFont(theme.mono_font(9.5))
+            lbl.setProperty("role", "muted")
+            lbl.setMinimumWidth(44)
+        self.lbl_curr.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        # Seek bar — preserves play state across drags (bug fix)
+        # Seek bar — preserves play state across drags
         self.seek_bar = QSlider(Qt.Orientation.Horizontal)
-        self.seek_bar.setFixedHeight(20)
+        self.seek_bar.setObjectName("SeekBar")
         self.seek_bar.setCursor(Qt.CursorShape.PointingHandCursor)
         self.seek_bar.sliderMoved.connect(self.set_position)
         self.seek_bar.sliderPressed.connect(self._on_seek_pressed)
         self.seek_bar.sliderReleased.connect(self._on_seek_released)
 
-        # Volume
+        self.file_label = QLabel("Nothing playing")
+        self.file_label.setObjectName("NowPlaying")
+        self.file_label.setMinimumWidth(180)
+        self.file_label.setMaximumWidth(360)
+
         self.vol_icon   = QLabel("🔊")
+        self.vol_icon.setProperty("role", "muted")
         self.vol_slider = QSlider(Qt.Orientation.Horizontal)
         self.vol_slider.setRange(0, 100)
         self.vol_slider.setValue(self._volume)
-        self.vol_slider.setFixedWidth(100)
+        self.vol_slider.setFixedWidth(96)
+        self.vol_slider.setToolTip("Volume")
         self.vol_slider.valueChanged.connect(self._set_volume)
-
-        # File label
-        self.file_label = QLabel("No Song Loaded")
-        self.file_label.setStyleSheet(
-            "font-weight: bold; font-size: 14px; color: #7f849c;"
-        )
 
         # Audio output selector — Linux/PipeWire only; omitted elsewhere.
         sinks = self._get_sink_descriptions()
         self.device_combo: QComboBox | None = None
         if sinks:
             self.device_combo = QComboBox()
-            self.device_combo.setFixedWidth(220)
-            self.device_combo.setToolTip("Audio Output Device")
-            self.device_combo.setStyleSheet(
-                "QComboBox { background-color: #313244; color: white;"
-                " border: 1px solid #45475a; padding: 4px; border-radius: 4px; }"
-                "QComboBox QAbstractItemView { background-color: #1e1e2e; color: white; }"
-            )
+            self.device_combo.setFixedWidth(200)
+            self.device_combo.setToolTip("Audio output device")
             # Block signals while populating so the initial selection doesn't
             # trigger a premature sink switch.
             self.device_combo.blockSignals(True)
@@ -554,127 +598,129 @@ class LrcSyncApp(QMainWindow):
             )
 
         row.addWidget(self.play_pause_btn)
+        row.addWidget(self.file_label)
         row.addWidget(self.lbl_curr)
-        row.addWidget(self.seek_bar)
+        row.addWidget(self.seek_bar, stretch=1)
         row.addWidget(self.lbl_tot)
+        row.addSpacing(8)
         row.addWidget(self.vol_icon)
         row.addWidget(self.vol_slider)
         if self.device_combo is not None:
             row.addWidget(self.device_combo)
-        row.addStretch()
-        row.addWidget(self.file_label)
-        return row
+        return bar
 
-    @staticmethod
-    def _neutral_button_style() -> str:
-        """The default look for a panel action button — used by every
-        button in the file panel and most of the lyrics panel, so a
-        button's importance (or lack of it) is legible at a glance
-        instead of every button competing for attention with its own
-        color."""
-        return (
-            f"QPushButton {{ background-color: #313244; color: {COLOR_FG.name()};"
-            " border: 1px solid #45475a; padding: 8px; border-radius: 4px; }"
-            "QPushButton:hover { background-color: #45475a; }"
-        )
+    # ------------------------------------------------------------------
+    # Workspace navigation
+    # ------------------------------------------------------------------
 
-    @staticmethod
-    def _primary_button_style() -> str:
-        """For the one action per panel worth calling out as primary
-        (currently just Save LRC) — accented, not just bigger/bolder."""
-        return (
-            f"QPushButton {{ background-color: {COLOR_ACCENT.name()}; color: #1e1e2e;"
-            " font-weight: bold; padding: 8px; border-radius: 4px; }"
-            f"QPushButton:hover {{ background-color: {COLOR_ACCENT.lighter(110).name()}; }}"
-        )
+    def _show_page(self, page: int) -> None:
+        self.workspace.setCurrentIndex(page)
 
-    @staticmethod
-    def _danger_button_style() -> str:
-        """For genuinely destructive actions only (currently just Clear
-        All) — an outline rather than a solid fill, so it reads as
-        "careful" without competing with a real error/missing state."""
-        return (
-            f"QPushButton {{ background-color: transparent; color: {COLOR_MISSING.name()};"
-            f" border: 1px solid {COLOR_MISSING.name()}; padding: 8px; border-radius: 4px; }}"
-            f"QPushButton:hover {{ background-color: {COLOR_MISSING.name()}; color: #1e1e2e; }}"
-        )
+    def _sync_tab_to_page(self, page: int) -> None:
+        tab = _PAGE_TO_TAB.get(page, TAB_EDITOR)
+        if self.tabs.currentIndex() != tab:
+            self.tabs.blockSignals(True)
+            self.tabs.setCurrentIndex(tab)
+            self.tabs.blockSignals(False)
 
-    @staticmethod
-    def _make_group_label(text: str) -> QLabel:
-        label = QLabel(text.upper())
-        label.setStyleSheet(
-            f"color: {COLOR_MUTED.name()}; font-size: 10px; font-weight: bold;"
-            " letter-spacing: 1px; margin-top: 6px;"
-        )
-        return label
+    def _on_tab_changed(self, tab: int) -> None:
+        if tab == TAB_EDITOR:
+            self.workspace.setCurrentIndex(WORKSPACE_EDITOR if self.song_is_loaded else WORKSPACE_EMPTY)
+        elif tab == TAB_SEARCH:
+            self.workspace.setCurrentIndex(WORKSPACE_SEARCH)
+            self.search_view.focus_query()
+        elif tab == TAB_DOWNLOADS:
+            self.workspace.setCurrentIndex(WORKSPACE_TRANSFERS)
+        elif tab == TAB_PLAYLIST:
+            self.workspace.setCurrentIndex(WORKSPACE_ACQUIRE)
+            self.download_view.link_input.setFocus()
+
+    def _on_active_downloads_changed(self, n: int) -> None:
+        self.tabs.setTabText(TAB_DOWNLOADS, f"Downloads ({n})" if n else "Downloads")
 
     def _build_lyrics_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(10)
+
+        # ── Karaoke: previous, current, next line ─────────────────────
+        karaoke = QWidget()
+        karaoke.setObjectName("KaraokePanel")
+        karaoke.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        k_layout = QVBoxLayout(karaoke)
+        k_layout.setContentsMargins(20, 12, 20, 12)
+        k_layout.setSpacing(2)
+        self.karaoke_prev = QLabel("")
+        self.karaoke_label = QLabel("Press play")
+        self.karaoke_next = QLabel("")
+        for lbl, name in ((self.karaoke_prev, "KaraokeContext"),
+                          (self.karaoke_label, "KaraokeCurrent"),
+                          (self.karaoke_next, "KaraokeContext")):
+            lbl.setObjectName(name)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setWordWrap(False)
+            lbl.setMinimumWidth(1)
+            k_layout.addWidget(lbl)
+        layout.addWidget(karaoke)
+
+        # ── Timeline ──────────────────────────────────────────────────
+        self.timeline = TimelineWidget()
+        self.timeline.setMouseTracking(True)
+        self.timeline.time_changed_bulk.connect(self._update_verses_from_timeline)
+        self.timeline.seek_requested.connect(self.set_position)
+        layout.addWidget(self.timeline)
 
         # Scrollable verse list
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setStyleSheet("background-color: #1e1e2e; border: none;")
         self._scroll_content = QWidget()
         self.lyrics_layout   = QVBoxLayout(self._scroll_content)
-        self.lyrics_layout.setSpacing(2)
+        self.lyrics_layout.setContentsMargins(0, 0, 6, 0)
+        self.lyrics_layout.setSpacing(1)
         self.lyrics_layout.addStretch()
         self.scroll_area.setWidget(self._scroll_content)
-        layout.addWidget(self.scroll_area)
+        layout.addWidget(self.scroll_area, stretch=1)
 
-        # Bottom actions. Save is the one action worth calling out as
-        # primary; everything else is grouped the same way the file panel
-        # groups its own buttons, and color is spent the way it's spent
-        # everywhere else in the app — status colors aren't decoration,
-        # so they're not reused here just to make five buttons look less
-        # identical. Clear All is the one genuinely destructive action
-        # and is styled (and placed) to read as separate from the rest.
-        save_btn = QPushButton("Save LRC")
-        save_btn.setToolTip("Save the .lrc sidecar file (Ctrl+S)")
+        # ── Actions: Save is the one primary; Clear All sits apart ────
+        actions = QHBoxLayout()
+        actions.setSpacing(8)
+        save_btn = QPushButton("Save")
+        save_btn.setToolTip("Save the .lrc file next to the song (Ctrl+S)")
+        save_btn.setProperty("variant", "primary")
         save_btn.clicked.connect(self._save_lrc_file)
-        save_btn.setStyleSheet(self._primary_button_style())
-        layout.addWidget(save_btn)
+        actions.addWidget(save_btn)
 
-        layout.addWidget(self._make_group_label("Fetch"))
-        fetch_row = QHBoxLayout()
-        get_lyrics_btn = QPushButton("Get Lyrics")
-        get_lyrics_btn.setToolTip("Search online for synced lyrics for this song")
-        get_lyrics_btn.clicked.connect(self._get_lyrics_online)
-        get_lyrics_btn.setStyleSheet(self._neutral_button_style())
-        fetch_row.addWidget(get_lyrics_btn)
-        layout.addLayout(fetch_row)
-
-        layout.addWidget(self._make_group_label("Edit"))
-        edit_row = QHBoxLayout()
         for label, handler, tooltip in [
-            ("Sort Lines", self._sort_verses_by_time,
-             "Reorder verses by their timestamp (Ctrl+T)"),
-            ("Shift All", self._shift_all_timestamps,
-             "Nudge every timestamp by the same +/- amount — fixes a track that's synced but drifting"),
+            ("Get lyrics…", self._get_lyrics_online,
+             "Look this song up online and pick the best version (Ctrl+L)"),
+            ("Sort lines", self._sort_verses_by_time,
+             "Reorder lines by their timestamp (Ctrl+T)"),
+            ("Shift all…", self._shift_all_timestamps,
+             "Move every timestamp by the same amount, for lyrics that are consistently early or late"),
         ]:
             btn = QPushButton(label)
             btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
-            btn.setStyleSheet(self._neutral_button_style())
-            edit_row.addWidget(btn)
-        layout.addLayout(edit_row)
-
-        clear_btn = QPushButton("Clear All")
-        clear_btn.setToolTip("Remove every verse and start this song's lyrics over")
-        clear_btn.clicked.connect(self._clear_lyrics)
-        clear_btn.setStyleSheet(self._danger_button_style())
-        layout.addWidget(clear_btn)
+            actions.addWidget(btn)
 
         # Optional: also write lyrics into the audio file's own tags on save.
-        self.embed_checkbox = QCheckBox("Also embed lyrics in audio file tags")
-        self.embed_checkbox.setStyleSheet(f"color: {COLOR_FG.name()}; font-size: 12px;")
-        self.embed_checkbox.setChecked(bool(self.settings.value("embed_lyrics", False, type=bool)))
+        self.embed_checkbox = QCheckBox("Embed in file tags")
+        self.embed_checkbox.setToolTip("Also write the lyrics into the audio file, so phones and players show them")
+        self.embed_checkbox.setChecked(_as_bool(self.settings.value("embed_lyrics", False), False))
         self.embed_checkbox.toggled.connect(
             lambda checked: self.settings.setValue("embed_lyrics", checked)
         )
-        layout.addWidget(self.embed_checkbox)
+        actions.addSpacing(8)
+        actions.addWidget(self.embed_checkbox)
+        actions.addStretch(1)
+
+        clear_btn = QPushButton("Clear all")
+        clear_btn.setToolTip("Remove every line and start this song's lyrics over")
+        clear_btn.setProperty("variant", "danger")
+        clear_btn.clicked.connect(self._clear_lyrics)
+        actions.addWidget(clear_btn)
+        layout.addLayout(actions)
 
         return panel
 
@@ -768,7 +814,7 @@ class LrcSyncApp(QMainWindow):
     # ==================================================================
 
     def _update_karaoke(self, position_ms: int) -> None:
-        """Update the karaoke label and playback highlight for *position_ms*.
+        """Update the karaoke lines and playback highlight for *position_ms*.
 
         Scans for the latest verse whose timestamp is both real (not the
         un-stamped ``DEFAULT_TIMESTAMP``) and at/before *position_ms*. Lines
@@ -786,12 +832,19 @@ class LrcSyncApp(QMainWindow):
                 best_idx = i
 
         if best_idx is None:
+            self.karaoke_prev.setText("")
             self.karaoke_label.setText("♪")
+            first = next((v.get_verse_text() for v in self._verses if v.get_verse_text().strip()), "")
+            self.karaoke_next.setText(first)
             self._set_playback_highlight(None)
             return
 
-        text = self._verses[best_idx].get_verse_text()
-        self.karaoke_label.setText(text or "♪")
+        def text_at(i: int) -> str:
+            return self._verses[i].get_verse_text() if 0 <= i < len(self._verses) else ""
+
+        self.karaoke_prev.setText(text_at(best_idx - 1))
+        self.karaoke_label.setText(text_at(best_idx) or "♪")
+        self.karaoke_next.setText(text_at(best_idx + 1))
         self._set_playback_highlight(self._verses[best_idx])
 
     def _set_playback_highlight(self, verse: Verse | None) -> None:
@@ -1052,29 +1105,18 @@ class LrcSyncApp(QMainWindow):
         self._update_title()
         self.status_bar.setText(status)
         self.library_panel.refresh_status(self.current_file_path)
-        self.file_label.setStyleSheet(
-            f"font-weight: bold; font-size: 14px; color: {COLOR_SYNCED.name()};"
-        )
 
     def _get_lyrics_online(self) -> None:
-        """Search for synced lyrics online for a free-text query (threaded)."""
+        """Look the loaded song up online and let the user pick a version."""
         if not self.song_filename:
             return
-        query, ok = QInputDialog.getText(
-            self,
-            "Search Lyrics",
-            "Artist - Title:",
-            QLineEdit.EchoMode.Normal,
-            os.path.splitext(self.song_filename)[0],
-        )
-        if not ok or not query:
-            return
-
-        self.status_bar.setText("Searching…")
-
-        self._search_thread = LyricsSearchThread(query)
-        self._search_thread.result_ready.connect(self._on_search_result)
-        self._search_thread.start()
+        import lyrics_fetch
+        info = lyrics_fetch.read_track_info(self.current_file_path)
+        duration = info.duration_s or (self.duration_ms / 1000 if self.duration_ms > 1 else None)
+        dialog = LyricsPickerDialog(info.artist, lyrics_fetch.clean_title(info.title), duration, self)
+        QTimer.singleShot(0, dialog.run_search)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.chosen_text:
+            self._on_search_result(dialog.chosen_text)
 
     def _on_search_result(self, result: str) -> None:
         if result:
@@ -1121,15 +1163,7 @@ class LrcSyncApp(QMainWindow):
         if not files:
             QMessageBox.information(self, "Info", "No missing lyrics to download.")
             return
-
-        self.progress_bar.setRange(0, len(files))
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(True)
-
-        self._downloader = LyricsDownloaderThread(files)
-        self._downloader.progress.connect(self._on_download_progress)
-        self._downloader.finished_batch.connect(self._on_batch_finished)
-        self._downloader.start()
+        self._fetch_lyrics_for(files)
 
     def _on_download_progress(
         self, message: str, done: int, total: int
@@ -1141,35 +1175,112 @@ class LrcSyncApp(QMainWindow):
         self, success: list[str], failed: list[str]
     ) -> None:
         self.progress_bar.setVisible(False)
-        parts = [f"Downloaded {len(success)} lyrics."]
+        parts = [f"Lyrics found for {len(success)} songs."]
         if failed:
-            parts.append(f"Failed: {len(failed)}.")
+            parts.append(f"Nothing found for {len(failed)}.")
         self.status_bar.setText("  ".join(parts))
+        self._downloader = None
+        if self._lyrics_pending:
+            pending, self._lyrics_pending = self._lyrics_pending, []
+            self._fetch_lyrics_for(pending)
 
-        for path in self.library_panel.real_file_paths():
-            self.library_panel.refresh_status(path)
-        # Reload lyrics pane if the current song was among the downloads.
-        if (
-            self.current_file_path
-            and os.path.basename(self.current_file_path) in success
-        ):
-            self._load_song(self.current_file_path)
+    def _on_lyrics_file_done(self, path: str, kind: str) -> None:
+        self.library_panel.refresh_status(path)
+        # Show freshly fetched lyrics if that song is open and untouched.
+        if kind != "none" and path == self.current_file_path and not self._dirty:
+            self._load_song(path, keep_playing=True, show_editor=False)
 
     def _fetch_lyrics_for(self, file_paths: list[str]) -> None:
-        """Kick off a lyrics-download pass for specific files (not the whole
-        library). Reuses the exact same downloader/handlers as the "Download
-        Lyrics" button — used to auto-fetch lyrics right after a Soulseek or
-        Spotify-triggered download lands.
-        """
+        """Queue a lyrics pass for specific files. If a pass is already
+        running, the files wait for it instead of starting a second
+        thread (replacing the reference to a running QThread would let
+        Python destroy it mid-run)."""
         if not file_paths:
+            return
+        running = self._downloader is not None and self._downloader.isRunning()
+        if running:
+            known = set(self._lyrics_pending)
+            self._lyrics_pending.extend(p for p in file_paths if p not in known)
             return
         self.progress_bar.setRange(0, len(file_paths))
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
-        self._downloader = LyricsDownloaderThread(file_paths)
+        embed = _as_bool(self.settings.value("embed_lyrics", False), False)
+        self._downloader = LyricsDownloaderThread(file_paths, embed)
         self._downloader.progress.connect(self._on_download_progress)
+        if hasattr(self._downloader, "file_done"):
+            self._downloader.file_done.connect(self._on_lyrics_file_done)
         self._downloader.finished_batch.connect(self._on_batch_finished)
         self._downloader.start()
+
+    # ==================================================================
+    # Library conversion (lossless -> Opus, in place)
+    # ==================================================================
+
+    def _convert_library(self) -> None:
+        import convert
+
+        if self._convert_thread is not None and self._convert_thread.isRunning():
+            QMessageBox.information(self, "Conversion Running", "A conversion is already running.")
+            return
+        if not convert.ffmpeg_available():
+            QMessageBox.warning(self, "ffmpeg Not Found",
+                                "Converting needs ffmpeg on your PATH (e.g. dnf install ffmpeg).")
+            return
+        library_dir = self.library_panel.library_dir()
+        if not library_dir or not os.path.isdir(library_dir):
+            QMessageBox.information(self, "No Library Folder",
+                                    "Set your music folder in Tools → Settings first.")
+            return
+        files = convert.find_lossless_files(library_dir)
+        if not files:
+            QMessageBox.information(self, "Nothing to Convert",
+                                    f"No FLAC, WAV or ALAC files in {library_dir}.")
+            return
+        size_gb = sum(os.path.getsize(f) for f in files if os.path.exists(f)) / 1024 ** 3
+        try:
+            bitrate = int(self.settings.value("opus_bitrate", 192) or 192)
+        except (TypeError, ValueError):
+            bitrate = 192
+        resp = QMessageBox.warning(
+            self, "Convert Lossless Files to Opus",
+            f"Convert {len(files)} lossless files ({size_gb:.1f} GB) in {library_dir} "
+            f"to Opus {bitrate} kbps?\n\n"
+            "Each original is deleted once its Opus copy is written and checked. Tags, "
+            "cover art and .lrc files are kept. This can't be undone, and any device that "
+            "syncs this folder will see the originals disappear.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        if self.current_file_path in files:
+            self.player.stop()
+            self.play_pause_btn.setText("▶")
+        self.progress_bar.setRange(0, len(files))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self._convert_thread = LibraryConvertThread(files, bitrate)
+        self._convert_thread.progress.connect(self._on_download_progress)
+        self._convert_thread.converted.connect(self._on_file_converted)
+        self._convert_thread.finished_all.connect(self._on_convert_finished)
+        self._convert_thread.start()
+
+    def _on_file_converted(self, old_path: str, new_path: str) -> None:
+        was_current = old_path == self.current_file_path
+        self.library_panel.replace_path(old_path, new_path)
+        if was_current:
+            self.player.set_media(self._vlc.media_new(new_path))
+
+    def _on_convert_finished(self, done: int, failed: list) -> None:
+        self.progress_bar.setVisible(False)
+        msg = f"Converted {done} files to Opus."
+        if failed:
+            msg += f" {len(failed)} failed and were left as they were."
+            QMessageBox.warning(self, "Some Files Weren't Converted",
+                                msg + "\n\n" + "\n".join(failed[:15]) + ("\n…" if len(failed) > 15 else ""))
+        self.status_bar.setText(msg)
 
     # ==================================================================
     # Soulseek integration (via slskd — see lrc_studio/soulseek.py)
@@ -1205,6 +1316,13 @@ class LrcSyncApp(QMainWindow):
         # Waiting longer doesn't help that; a fresh restart usually does.
         # Only do this for a process we launched ourselves — never kill
         # an instance the user is running (and watching) by hand.
+        # Never while downloads are running: restarting slskd aborts every
+        # transfer in flight ("Application shut down").
+        if self._downloads_active():
+            self.status_bar.setText(
+                "slskd isn't logged in to Soulseek right now; it usually reconnects by itself."
+            )
+            return client
         if self._slskd_process is not None and self._restart_slskd():
             if self._wait_for_slskd(client):
                 return client
@@ -1217,6 +1335,9 @@ class LrcSyncApp(QMainWindow):
             "or check its URL/API key under Tools → Settings.",
         )
         return None
+
+    def _downloads_active(self) -> bool:
+        return self.transfers_view.active_count() > 0 or self.download_view.is_batch_active()
 
     def _restart_slskd(self) -> bool:
         """Kill and relaunch the slskd process we control."""
@@ -1258,12 +1379,13 @@ class LrcSyncApp(QMainWindow):
 
         self.status_bar.setText("Starting slskd…")
         QApplication.processEvents()
+        log_path = os.path.join(root_dir, "slskd-bin", "slskd-app.log")
         try:
+            log = open(log_path, "ab")
             self._slskd_process = subprocess.Popen(
-                [script_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                [script_path], stdout=log, stderr=subprocess.STDOUT,
             )
+            log.close()   # the child keeps its own handle
         except OSError as exc:
             QMessageBox.warning(
                 self, "Couldn't Start slskd", f"Failed to launch {script_path}: {exc}",
@@ -1292,44 +1414,8 @@ class LrcSyncApp(QMainWindow):
         SettingsDialog(self.settings, self).exec()
 
     def _find_music(self) -> None:
-        if self._soulseek_download_thread is not None and self._soulseek_download_thread.isRunning():
-            QMessageBox.information(
-                self, "Soulseek Download In Progress",
-                "A Soulseek download is already running — wait for it to "
-                "finish before starting another one.",
-            )
-            return
-
-        client = self._get_slskd_client()
-        if client is None:
-            return
-
-        dialog = SoulseekSearchDialog("", self)
-        dialog.query_input.setPlaceholderText("Search Soulseek, or paste a Spotify link…")
-        self._active_find_music_dialog = dialog   # exposed for testability
-
-        def run_search() -> None:
-            query = dialog.query_input.text().strip()
-            if not query:
-                return
-            if is_spotify_link(query):
-                dialog.reject()
-                self._open_batch_import(query)
-                return
-            dialog.set_searching(True)
-            self._soulseek_search_thread = SoulseekSearchThread(client, query)
-            self._soulseek_search_thread.results_ready.connect(
-                lambda results: (dialog.set_searching(False), dialog.show_results(results))
-            )
-            self._soulseek_search_thread.search_failed.connect(
-                lambda msg: (dialog.set_searching(False), dialog.show_error(msg))
-            )
-            self._soulseek_search_thread.start()
-
-        dialog.search_button.clicked.connect(run_search)
-
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected_file:
-            self._start_soulseek_download(client, dialog.selected_file, auto_fetch_lyrics=True)
+        self._show_page(WORKSPACE_SEARCH)
+        self.search_view.focus_query()
 
     def _open_batch_import(self, link: str) -> None:
         self.workspace.setCurrentIndex(WORKSPACE_ACQUIRE)
@@ -1341,32 +1427,23 @@ class LrcSyncApp(QMainWindow):
         if not self.download_view.is_batch_active():
             self.download_view.start_fetch(link)
 
-    def _start_soulseek_download(
-        self, client: SlskdClient, file: SoulseekFile, auto_fetch_lyrics: bool,
-    ) -> None:
-        downloads_dir = str(self.settings.value("slskd_downloads_dir", "")).strip()
-        library_dir = str(self.settings.value("library_dir", "")).strip() or os.getcwd()
+    def _queue_downloads(self, files: list) -> None:
+        # A file picked by hand waits in its peer's queue as long as it
+        # takes, unless other peers have the same file: then after four
+        # minutes it moves on to the next copy.
+        alternatives = getattr(self.search_view, "alternatives_for", None)
+        added = len(self.transfers_view.enqueue(files, alternatives=alternatives, queue_patience_s=240))
+        if added:
+            self.status_bar.setText(
+                f"Queued {added} download{'s' if added != 1 else ''}. Follow them in Downloads (Ctrl+J)."
+            )
+        else:
+            self.status_bar.setText("Already in the download queue.")
 
-        self.status_bar.setText(f"Downloading {file.display_name} from Soulseek…")
-        self._soulseek_download_thread = SoulseekDownloadThread(
-            client, downloads_dir, library_dir, file,
-        )
-        self._soulseek_download_thread.progress.connect(self.status_bar.setText)
-        self._soulseek_download_thread.finished_ok.connect(
-            lambda path: self._on_soulseek_download_ok(path, auto_fetch_lyrics)
-        )
-        self._soulseek_download_thread.finished_fail.connect(self._on_soulseek_download_fail)
-        self._soulseek_download_thread.start()
-
-    def _on_soulseek_download_ok(self, local_path: str, auto_fetch_lyrics: bool) -> None:
-        self.status_bar.setText(f"Downloaded: {os.path.basename(local_path)}")
-        self._process_added_files([local_path])
-        if auto_fetch_lyrics:
-            self._fetch_lyrics_for([local_path])
-
-    def _on_soulseek_download_fail(self, message: str) -> None:
-        self.status_bar.setText("Soulseek download failed.")
-        QMessageBox.warning(self, "Download Failed", message)
+    def _on_transfer_ready(self, path: str) -> None:
+        self.library_panel.add_files([path])
+        self.status_bar.setText(f"Downloaded {os.path.basename(path)}. Fetching lyrics…")
+        self._fetch_lyrics_for([path])
 
     # ==================================================================
     # Library dedup (shared with the Download tab)
@@ -1473,6 +1550,15 @@ class LrcSyncApp(QMainWindow):
         if not self._confirm_discard_if_dirty():
             event.ignore()
             return
+        if self._downloads_active() and QMessageBox.question(
+            self, "Downloads Running",
+            f"{self.transfers_view.active_count()} downloads are still running. "
+            "Quitting stops them. Quit anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        ) != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
 
@@ -1480,12 +1566,12 @@ class LrcSyncApp(QMainWindow):
         # QThread objects with it) goes away — otherwise Qt either warns
         # loudly ("QThread: Destroyed while thread is still running") or
         # crashes outright.
-        stop_thread(self._search_thread)
-        stop_thread(self._soulseek_search_thread)
-        stop_thread(self._soulseek_download_thread)
         stop_thread(self._qa_thread)
         stop_thread(self._downloader)
+        stop_thread(self._convert_thread)
         self.download_view.shutdown()
+        self.search_view.shutdown()
+        self.transfers_view.shutdown()
 
         if self._slskd_process is not None and self._slskd_process.poll() is None:
             self._slskd_process.terminate()
@@ -1518,49 +1604,70 @@ class LrcSyncApp(QMainWindow):
         if self.current_file_path == old_path:
             self.current_file_path = new_path
             self.song_filename = os.path.basename(new_path)
-            self.file_label.setText(self.song_filename)
-        self.status_bar.setText(f"Renamed to {os.path.basename(new_path)}.")
+            self.file_label.setText(os.path.splitext(self.song_filename)[0])
 
     def _load_file_from_index(self, index: int) -> None:
-        if 0 <= index < self.library_panel.row_count():
-            self.library_panel.select_row(index)
-            self._load_song(self.library_panel.real_file_paths()[index])
+        paths = self.library_panel.real_file_paths()
+        if 0 <= index < len(paths):
+            self.library_panel.select_path(paths[index])
+            self._load_song(paths[index])
 
-    def _load_song(self, path: str) -> None:
+    def _load_library(self) -> None:
+        added = self.library_panel.load_library_folder()
+        if added:
+            self.status_bar.setText(f"Library: {self.library_panel.row_count()} songs.")
+
+    def _load_song(self, path: str, keep_playing: bool = False, show_editor: bool = True) -> None:
+        """Load *path* into the player and editor. *keep_playing* reloads
+        the lyrics of the song already playing without touching playback;
+        *show_editor* False leaves the user on whatever page they're on
+        (auto-advance, background lyrics arriving)."""
         if not os.path.exists(path):
             return
 
+        resume_at = self.player.get_time() if keep_playing and path == self.current_file_path else None
+        was_playing = bool(self.player.is_playing()) if resume_at is not None else False
+
         self.current_file_path = path
         self.song_filename     = os.path.basename(path)
-        self.file_label.setText(self.song_filename)
+        self.file_label.setText(os.path.splitext(self.song_filename)[0])
+        self.file_label.setToolTip(path)
         self._ended_handled = False
+        self.library_panel.set_current(path)
 
-        self.player.set_media(self._vlc.media_new(path))
+        if resume_at is None:
+            self.player.set_media(self._vlc.media_new(path))
+            self.play_pause_btn.setText("▶")
         self.song_is_loaded = True
-        self.play_pause_btn.setText("▶")
-        self.workspace.setCurrentIndex(WORKSPACE_EDITOR)
+        if show_editor or self.workspace.currentIndex() == WORKSPACE_EMPTY:
+            self.workspace.setCurrentIndex(WORKSPACE_EDITOR)
 
         lrc_path = os.path.splitext(path)[0] + ".lrc"
-        color    = analyze_lrc_status(lrc_path)
-        self.file_label.setStyleSheet(
-            f"font-weight: bold; font-size: 14px; color: {color.name()};"
-        )
-
         self._replace_all_verses([])
         if os.path.exists(lrc_path):
             try:
                 with open(lrc_path, encoding="utf-8") as fh:
                     self._parse_and_add_lyrics(fh.read())
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 self.status_bar.setText(f"Could not read LRC: {exc}")
         else:
             self._add_verse(DEFAULT_TIMESTAMP, "")
             self._update_timeline()
+        self.karaoke_prev.setText("")
+        self.karaoke_label.setText("♪" if self._verses and self._verses[0].get_verse_text() else "No lyrics yet")
+        self.karaoke_next.setText("")
+        if resume_at is not None and was_playing:
+            self.play_pause_btn.setText("⏸")
 
         # Freshly loaded content matches disk — not dirty until the user edits it.
         self._dirty = False
         self._update_title()
         self.status_bar.setText(f"Loaded: {self.song_filename}")
+
+    def _play(self) -> None:
+        if self.song_is_loaded:
+            self.player.play()
+            self.play_pause_btn.setText("⏸")
 
     # ==================================================================
     # Drag-and-drop
@@ -1573,5 +1680,9 @@ class LrcSyncApp(QMainWindow):
             event.ignore()             # type: ignore[attr-defined]
 
     def dropEvent(self, event: object) -> None:  # type: ignore[override]
-        urls = event.mimeData().urls()           # type: ignore[attr-defined]
-        self._process_added_files([u.toLocalFile() for u in urls])
+        paths: list[str] = []
+        for url in event.mimeData().urls():      # type: ignore[attr-defined]
+            local = url.toLocalFile()
+            paths.extend(scan_audio_files(local) if os.path.isdir(local) else [local])
+        self._process_added_files(paths)
+

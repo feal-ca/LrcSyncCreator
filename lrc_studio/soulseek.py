@@ -16,8 +16,13 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
-from dataclasses import dataclass
+import unicodedata
+from dataclasses import dataclass, field
+from functools import cached_property
+from typing import Callable
+from urllib.parse import quote
 
 import requests
 from rapidfuzz import fuzz
@@ -103,6 +108,36 @@ class SoulseekFile:
     @property
     def display_name(self) -> str:
         return self.filename.replace("\\", "/").rsplit("/", 1)[-1]
+
+    @property
+    def folder(self) -> str:
+        """Remote directory, in the peer's own separators (what slskd's
+        browse endpoint expects back)."""
+        sep_at = max(self.filename.rfind("\\"), self.filename.rfind("/"))
+        return self.filename[:sep_at] if sep_at >= 0 else ""
+
+    @property
+    def folder_name(self) -> str:
+        """Last component of the remote directory — usually the album."""
+        return self.folder.replace("\\", "/").rsplit("/", 1)[-1]
+
+    @property
+    def extension(self) -> str:
+        return os.path.splitext(self.filename)[1].lower().lstrip(".")
+
+    @property
+    def format_label(self) -> str:
+        """Short quality tag for a results table: "FLAC", "MP3 320", "OPUS 160"."""
+        ext = self.extension.upper() or "?"
+        if self.is_lossless:
+            return ext
+        kbps = self.effective_kbps
+        return f"{ext} {kbps}" if kbps else ext
+
+    @cached_property
+    def haystack(self) -> str:
+        """Normalized full path + username, what the results filter matches."""
+        return normalize_text(f"{self.filename} {self.username}")
 
     @property
     def is_lossless(self) -> bool:
@@ -217,7 +252,7 @@ class SlskdClient:
             return False, "slskd is still connecting to Soulseek — try again shortly."
         return False, "slskd is running but not logged in to Soulseek (check its credentials)."
 
-    def _post_search(self, query: str):
+    def _post_search(self, query: str, search_timeout_ms: int | None = None):
         """POST a new search, retrying once on a transient 409.
 
         slskd returns 409 for ``POST /api/v0/searches`` when its own
@@ -228,8 +263,11 @@ class SlskdClient:
         reconnects on its own, so poll ``check_connection`` briefly and
         retry once rather than failing the whole search outright.
         """
+        body: dict = {"searchText": query}
+        if search_timeout_ms:
+            body["searchTimeout"] = int(search_timeout_ms)
         try:
-            return self._request("POST", "/api/v0/searches", json={"searchText": query})
+            return self._request("POST", "/api/v0/searches", json=body)
         except SlskdError as exc:
             if exc.status_code != 409:
                 raise
@@ -239,10 +277,13 @@ class SlskdClient:
                 if ok:
                     break
                 time.sleep(1.0)
-            return self._request("POST", "/api/v0/searches", json={"searchText": query})
+            return self._request("POST", "/api/v0/searches", json=body)
 
     def search(
         self, query: str, wait_s: float = 20.0, poll_interval_s: float = 1.0,
+        on_progress: Callable[[int, int], None] | None = None,
+        stop_event: threading.Event | None = None,
+        search_timeout_ms: int | None = None,
     ) -> list[SoulseekFile]:
         """Run a search and block until it completes (or *wait_s* elapses).
 
@@ -261,14 +302,23 @@ class SlskdClient:
         ``Completed, Cancelled`` immediately and ``/responses`` then returns
         whatever was collected so far, which in practice is the vast
         majority of the peers that were ever going to answer.
+
+        *on_progress(peers, files)* is called every poll with slskd's live
+        counters, so a UI can show the search filling up even though the
+        responses themselves only arrive at the end. Setting *stop_event*
+        ends the wait early ("show me what you have").
         """
-        resp = self._post_search(query)
+        resp = self._post_search(query, search_timeout_ms)
         search_id = resp.json()["id"]
 
         deadline = time.monotonic() + wait_s
         is_complete = False
         while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
             state = self._request("GET", f"/api/v0/searches/{search_id}").json()
+            if on_progress is not None:
+                on_progress(int(state.get("responseCount") or 0), int(state.get("fileCount") or 0))
             if state.get("isComplete"):
                 is_complete = True
                 break
@@ -307,6 +357,48 @@ class SlskdClient:
                 ))
 
         results.sort(key=availability_key)
+        return results
+
+    def browse_folder(self, username: str, directory: str, like: SoulseekFile | None = None) -> list[SoulseekFile]:
+        """Every audio file in one of *username*'s shared folders.
+
+        Used for "download the whole folder" (an album) — a search only
+        returns the files that matched the query, not their siblings.
+        slskd answers ``POST /users/{username}/directory`` with either one
+        directory object or a list of them, and file names inside may be
+        bare basenames relative to that directory; both are handled. Peer
+        stats (queue, free slot, speed) are copied from *like*, the search
+        result the folder was reached from, since the browse response
+        doesn't carry them.
+        """
+        data = self._request(
+            "POST", f"/api/v0/users/{quote(username, safe='')}/directory",
+            json={"directory": directory},
+        ).json()
+        directories = data if isinstance(data, list) else [data]
+        results: list[SoulseekFile] = []
+        for d in directories:
+            if not isinstance(d, dict):
+                continue
+            dir_name = d.get("name") or directory
+            sep = "\\" if "\\" in dir_name or "/" not in dir_name else "/"
+            for f in d.get("files", []) or []:
+                name = f.get("filename", "")
+                if "\\" not in name and "/" not in name:
+                    name = f"{dir_name}{sep}{name}"
+                if not name.lower().endswith(AUDIO_EXTENSIONS):
+                    continue
+                results.append(SoulseekFile(
+                    username=username,
+                    filename=name,
+                    size=f.get("size", 0),
+                    bitrate=f.get("bitRate"),
+                    length_s=f.get("length"),
+                    queue_length=like.queue_length if like else 0,
+                    has_free_slot=like.has_free_slot if like else False,
+                    upload_speed=like.upload_speed if like else None,
+                ))
+        results.sort(key=lambda r: r.filename.lower())
         return results
 
     def download(self, file: SoulseekFile) -> None:
@@ -351,6 +443,74 @@ class SlskdClient:
                 if f.get("filename") == filename:
                     return f
         return None
+
+
+def normalize_text(text: str) -> str:
+    """Lowercase, accents stripped, punctuation/underscores to single
+    spaces — so "rosalia" finds "ROSALÍA_-_Malamente.flac"."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    no_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return re.sub(r"[\W_]+", " ", no_marks.lower()).strip()
+
+
+@dataclass
+class ResultFilter:
+    """Client-side narrowing of search results, Nicotine-style.
+
+    *text* is matched against the whole remote path plus the username, so
+    searching a title and then typing the artist (or the album, or the
+    uploader) here narrows to the right copies. Words are ANDed; a word
+    starting with "-" excludes; "double quotes" keep a phrase together.
+    """
+
+    text: str = ""
+    formats: str = "any"          # "any" | "lossless" | "lossy" | an extension like "mp3"
+    min_kbps: int = 0             # lossy only; lossless always passes
+    free_slot_only: bool = False
+    _include: list[str] = field(default_factory=list, init=False, repr=False)
+    _exclude: list[str] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.set_text(self.text)
+
+    def set_text(self, text: str) -> None:
+        self.text = text
+        self._include, self._exclude = [], []
+        for quoted, bare in re.findall(r'(-?"[^"]*")|(\S+)', text):
+            raw = quoted or bare
+            negate = raw.startswith("-") and len(raw) > 1
+            word = normalize_text(raw[1:] if negate else raw)
+            if word:
+                (self._exclude if negate else self._include).append(word)
+
+    @property
+    def is_active(self) -> bool:
+        return bool(self._include or self._exclude or self.formats != "any"
+                    or self.min_kbps or self.free_slot_only)
+
+    def matches(self, f: SoulseekFile) -> bool:
+        if self.free_slot_only and not f.has_free_slot:
+            return False
+        if self.formats == "lossless" and not f.is_lossless:
+            return False
+        if self.formats == "lossy" and f.is_lossless:
+            return False
+        if self.formats not in ("any", "lossless", "lossy") and f.extension != self.formats:
+            return False
+        if self.min_kbps and not f.is_lossless:
+            kbps = f.effective_kbps
+            if kbps is None or kbps < self.min_kbps:
+                return False
+        hay = f.haystack
+        padded = f" {hay} "
+        for word in self._include:
+            if word not in hay:
+                return False
+        for word in self._exclude:
+            # Whole-word for exclusions, so "-live" doesn't drop "Oliver".
+            if f" {word} " in padded:
+                return False
+        return True
 
 
 def find_downloaded_file(downloads_dir: str, remote_filename: str, expected_size: int) -> str | None:
@@ -421,30 +581,76 @@ def _filter_and_rank(
     return [f for _score, f in scored]
 
 
+# Separators and punctuation that never help a Soulseek token match ("Cap.
+# 2: Havia de Passar" with "2:" as a token matches nothing). Apostrophes
+# stay: they're part of words like "L'Amour".
+_QUERY_PUNCT_RE = re.compile(r"[\s,;:!?¿¡\"“”()\[\]{}/\\|+*&·.]+|\s-+\s|^-+|-+$")
+_ARTIST_SPLIT_RE = re.compile(
+    r"\s*(?:,|;|&|\bfeat\.?|\bft\.?|\bfeaturing\b|\bx\b)\s*", re.IGNORECASE,
+)
+
+# Automatic matching doesn't need slskd's full 15 s: most peers answer in
+# the first few seconds, and a rare track that needs longer usually isn't
+# there at all.
+AUTO_SEARCH_TIMEOUT_MS = 10_000
+
+
+def query_text(text: str) -> str:
+    """*text* cleaned for use as Soulseek search tokens."""
+    text = clean_query_text(text)
+    return re.sub(r"\s+", " ", _QUERY_PUNCT_RE.sub(" ", text)).strip()
+
+
+def primary_artist(artist: str) -> str:
+    """First credited artist: "La Fúmiga, The Tyets" -> "La Fúmiga"."""
+    parts = [p for p in _ARTIST_SPLIT_RE.split(artist or "") if p.strip()]
+    return parts[0].strip() if parts else (artist or "").strip()
+
+
+def build_queries(artist: str, title: str) -> list[str]:
+    """Queries to try, most precise first, without duplicates.
+
+    Artist + title comes first: Soulseek only returns files whose path
+    contains every word, so it goes straight to the right copies. A title
+    on its own floods for common names ("Your Love" brings back 9,000+
+    files from 250 peers, past slskd's response limit, which can push the
+    right artist's copies out entirely). Title alone and artist alone are
+    still tried next, for peers whose folders spell the artist differently.
+    """
+    a = query_text(primary_artist(artist))
+    t = query_text(title)
+    title_words = {w.lower() for w in t.split()}
+    extra = [w for w in a.split() if w.lower() not in title_words]
+    combined = " ".join(extra + t.split())
+    queries: list[str] = []
+    for q in (combined, t, a):
+        if q and q.lower() not in (x.lower() for x in queries):
+            queries.append(q)
+    return queries
+
+
 def find_best_candidates(
     client: SlskdClient, artist: str, title: str, min_score: int = _DEFAULT_RELEVANCE_THRESHOLD,
+    on_progress: Callable[[int, int], None] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> list[SoulseekFile]:
     """Search Soulseek for (*artist*, *title*), automatically, without a
     human in the loop to judge results by eye.
 
-    Soulseek's own search is a loose token match across peers' shared
-    folder names, so one combined "artist title" query routinely comes
-    back empty even when the track is out there under a plain filename —
-    the same reason manually searching by just the title (or just the
-    artist), then filtering the results by eye, tends to work better than
-    one big combined query. This automates that: try the title alone,
-    then the artist alone, then both combined, stopping at the first
-    attempt that yields any candidate above *min_score* — and within
-    each attempt, rank by relevance first so a loosely-matched wrong-song
-    result never outranks a real one on availability/bitrate alone.
+    Tries ``build_queries`` in order and stops at the first one that
+    yields any candidate above *min_score*; within each attempt candidates
+    rank by relevance first, so a loosely matched wrong song never
+    outranks a real one on availability or bitrate alone.
     """
-    title_clean = clean_query_text(title)
-    artist_clean = clean_query_text(artist)
-
-    for query in (title_clean, artist_clean, f"{artist_clean} {title_clean}".strip()):
-        if not query:
-            continue
-        ranked = _filter_and_rank(client.search(query), artist, title, min_score)
+    for query in build_queries(artist, title):
+        if stop_event is not None and stop_event.is_set():
+            break
+        results = client.search(
+            query, wait_s=AUTO_SEARCH_TIMEOUT_MS / 1000 + 4,
+            on_progress=on_progress, stop_event=stop_event,
+            search_timeout_ms=AUTO_SEARCH_TIMEOUT_MS,
+        )
+        ranked = _filter_and_rank(results, artist, title, min_score)
         if ranked:
             return ranked
     return []

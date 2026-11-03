@@ -57,6 +57,10 @@ def window(qapp, monkeypatch, tmp_path):
     # never see a real confirmation dialog at teardown regardless of what
     # dirty state they left behind, so force it clean before closing.
     win._dirty = False
+    # Closing asks before stopping running downloads; a test that leaves a
+    # fake batch "active" must not block teardown on that modal dialog.
+    from PyQt6.QtWidgets import QMessageBox as _QMB
+    monkeypatch.setattr(_QMB, "question", lambda *a, **k: _QMB.StandardButton.Yes)
     win.close()
 
 
@@ -133,52 +137,59 @@ def test_clear_lyrics_skips_the_prompt_when_theres_nothing_to_clear(window, monk
 # Unified Find Music entry point
 # ---------------------------------------------------------------------------
 
+def test_find_music_opens_the_search_page(window):
+    window._find_music()
+
+    assert window.workspace.currentIndex() == app_module.WORKSPACE_SEARCH
+    assert window.tabs.currentIndex() == app_module.TAB_SEARCH
+
+
 def test_find_music_routes_spotify_link_to_batch_import(window, monkeypatch):
-    from PyQt6.QtWidgets import QDialog
-
     calls = []
-    monkeypatch.setattr(window, "_get_slskd_client", lambda: object())
+    clients = []
+    monkeypatch.setattr(window, "_get_slskd_client", lambda: clients.append(1) or object())
     monkeypatch.setattr(window, "_open_batch_import", lambda link: calls.append(link))
-    # dialog.exec() is modal and blocks in real use — run_search is wired
-    # to the Search button *before* exec() is called, so replacing exec()
-    # with a no-op that returns immediately (Rejected) lets _find_music()
-    # return control to the test without ever blocking, while leaving the
-    # live dialog object and its button wiring fully intact to drive by
-    # hand afterward.
-    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
 
-    # is_spotify_link() requires a genuine 22-character Spotify ID (same
-    # regex extract_spotify_ref() already enforces) — a short fake ID like
-    # "abc123" wouldn't match, so run_search() would silently fall through
-    # to the real-Soulseek-search branch and start a real SoulseekSearchThread
-    # against this test's dummy `object()` client, crashing the process
-    # when that thread calls a `.search()` method the dummy doesn't have.
+    # is_spotify_link() requires a genuine 22-character Spotify ID; a short
+    # fake one would fall through to a real Soulseek search.
     spotify_link = "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
 
     window._find_music()
-    dialog = window._active_find_music_dialog
-    dialog.query_input.setText(spotify_link)
-    dialog.search_button.click()
+    window.search_view.query_input.setText(spotify_link)
+    window.search_view.search_button.click()
 
     assert calls == [spotify_link]
+    assert clients == []   # routed before any slskd connection is needed
+
+
+class _Sig:
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, fn):
+        self.slots.append(fn)
+
+    def emit(self, *args):
+        for fn in self.slots:
+            fn(*args)
 
 
 def test_find_music_routes_plain_text_to_soulseek_search(window, monkeypatch):
-    # Review finding RF1 (plan's own Review Focus item, never actually
-    # tested): plain or malformed text must fall through to a direct
-    # Soulseek search, not silently do nothing. Only the Spotify-link
-    # branch was tested above; this covers the other one.
-    from PyQt6.QtWidgets import QDialog
+    # Plain or malformed text must fall through to a direct Soulseek
+    # search, not silently do nothing.
+    import search_view
 
     class _FakeSearchThread:
         instances = []
 
-        def __init__(self, client, query) -> None:
+        def __init__(self, client, query, wait_s=25.0) -> None:
             self.client = client
             self.query = query
             self.started = False
-            self.results_ready = type("Signal", (), {"connect": lambda self, fn: None})()
-            self.search_failed = type("Signal", (), {"connect": lambda self, fn: None})()
+            self.progress = _Sig()
+            self.results_ready = _Sig()
+            self.search_failed = _Sig()
+            self.finished = _Sig()
             _FakeSearchThread.instances.append(self)
 
         def start(self) -> None:
@@ -187,21 +198,29 @@ def test_find_music_routes_plain_text_to_soulseek_search(window, monkeypatch):
         def isRunning(self) -> bool:
             return False
 
-    monkeypatch.setattr(app_module, "SoulseekSearchThread", _FakeSearchThread)
+        def request_stop(self) -> None:
+            pass
+
+        request_cancel = request_stop
+
+        def wait(self, *_a) -> bool:
+            return True
+
+    monkeypatch.setattr(search_view, "SoulseekLiveSearchThread", _FakeSearchThread)
     monkeypatch.setattr(window, "_get_slskd_client", lambda: object())
     batch_import_calls = []
     monkeypatch.setattr(window, "_open_batch_import", lambda link: batch_import_calls.append(link))
-    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
 
     window._find_music()
-    dialog = window._active_find_music_dialog
-    dialog.query_input.setText("Bohemian Rhapsody Queen")
-    dialog.search_button.click()
+    window.search_view.query_input.setText("Bohemian Rhapsody Queen")
+    window.search_view.search_button.click()
 
     assert batch_import_calls == []  # never mistaken for a Spotify link
     assert len(_FakeSearchThread.instances) == 1
-    assert _FakeSearchThread.instances[0].query == "Bohemian Rhapsody Queen"
-    assert _FakeSearchThread.instances[0].started is True
+    thread = _FakeSearchThread.instances[0]
+    assert thread.query == "Bohemian Rhapsody Queen"
+    assert thread.started is True
+    assert window.search_view._history()[0] == "Bohemian Rhapsody Queen"
 
 
 def test_command_table_has_one_find_music_entry_not_two(window):
@@ -227,9 +246,10 @@ def test_batch_download_lyrics_accepts_paths_directly(window, monkeypatch):
         # which PyQt turns into a fatal C++ abort rather than a normal
         # Python exception — the same issue test_workspace.py's
         # _FakeFetchThread had (see that file's docstring).
-        def __init__(self, files):
+        def __init__(self, files, embed=False):
             started.append(files)
         progress = type("Signal", (), {"connect": lambda self, fn: None})()
+        file_done = type("Signal", (), {"connect": lambda self, fn: None})()
         finished_batch = type("Signal", (), {"connect": lambda self, fn: None})()
         def start(self): pass
         def isRunning(self): return False
@@ -239,6 +259,53 @@ def test_batch_download_lyrics_accepts_paths_directly(window, monkeypatch):
     window._batch_download_lyrics(["/fake/a.mp3", "/fake/b.mp3"])
 
     assert started == [["/fake/a.mp3", "/fake/b.mp3"]]
+
+
+def test_second_lyrics_batch_waits_for_the_running_one(window, monkeypatch):
+    # Starting a new pass used to replace self._downloader while the
+    # previous QThread was still running, letting Python destroy it mid-run.
+    started = []
+
+    class FakeThread:
+        def __init__(self, files, embed=False):
+            self.files = files
+            self.running = True
+            started.append(files)
+        progress = type("Signal", (), {"connect": lambda self, fn: None})()
+        file_done = type("Signal", (), {"connect": lambda self, fn: None})()
+        finished_batch = type("Signal", (), {"connect": lambda self, fn: None})()
+        def start(self): pass
+        def isRunning(self): return self.running
+        def request_cancel(self): self.running = False
+        def wait(self, *_a): return True
+
+    monkeypatch.setattr(app_module, "LyricsDownloaderThread", FakeThread)
+
+    window._fetch_lyrics_for(["/a.mp3"])
+    first = window._downloader
+    window._fetch_lyrics_for(["/b.mp3", "/c.mp3"])
+
+    assert window._downloader is first
+    assert started == [["/a.mp3"]]
+
+    first.running = False
+    window._on_batch_finished(["a.mp3"], [])
+
+    assert started == [["/a.mp3"], ["/b.mp3", "/c.mp3"]]
+    window._downloader.running = False
+
+
+def test_queue_downloads_hands_files_to_the_downloads_page(window, monkeypatch):
+    queued = []
+    monkeypatch.setattr(
+        window.transfers_view, "enqueue",
+        lambda files, alternatives=None, queue_patience_s=None: queued.append(files) or list(range(len(files))),
+    )
+
+    window._queue_downloads(["f1", "f2"])
+
+    assert queued == [["f1", "f2"]]
+    assert "Queued 2 downloads" in window.status_bar.text()
 
 
 def test_batch_download_lyrics_with_empty_list_shows_info_and_starts_nothing(window, monkeypatch):
@@ -373,3 +440,23 @@ def test_loading_a_song_with_existing_verses_does_not_trigger_the_clear_confirma
     window._load_song(str(f2))
 
     assert asked == []
+
+
+def test_slskd_is_never_restarted_while_downloads_are_running(window, monkeypatch):
+    # Restarting slskd aborts every transfer in flight ("Application shut
+    # down") — seen in a real session when slskd briefly looked offline.
+    window.settings.setValue("slskd_url", "http://127.0.0.1:1")
+    window.settings.setValue("slskd_api_key", "k")
+    monkeypatch.setattr(app_module.SlskdClient, "check_connection", lambda self: (False, "not logged in"))
+    monkeypatch.setattr(window, "_ensure_slskd_running", lambda: True)
+    monkeypatch.setattr(window, "_wait_for_slskd", lambda client, timeout_s=25.0: False)
+    window._slskd_process = type("P", (), {"poll": lambda self: None})()
+    restarts = []
+    monkeypatch.setattr(window, "_restart_slskd", lambda: restarts.append(1) or True)
+    monkeypatch.setattr(window.transfers_view, "active_count", lambda: 2)
+
+    client = app_module.LrcSyncApp._get_slskd_client(window)
+
+    assert restarts == []
+    assert client is not None
+    window._slskd_process = None

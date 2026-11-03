@@ -69,12 +69,37 @@ def window(qapp, monkeypatch, tmp_path):
     # _confirm_discard_if_dirty — see test_app_commands.py's window
     # fixture for the full root-cause writeup of this exact hang.
     win._dirty = False
+    # Closing asks before stopping running downloads; a test that leaves a
+    # fake batch "active" must not block teardown on that modal dialog.
+    from PyQt6.QtWidgets import QMessageBox as _QMB
+    monkeypatch.setattr(_QMB, "question", lambda *a, **k: _QMB.StandardButton.Yes)
     win.close()
 
 
-def test_workspace_is_a_stacked_widget_with_three_pages(window):
+def test_workspace_is_a_stacked_widget_with_five_pages(window):
     assert isinstance(window.workspace, QStackedWidget)
-    assert window.workspace.count() == 3
+    assert window.workspace.count() == 5
+
+
+def test_tab_bar_follows_programmatic_page_changes(window):
+    window._show_page(app_module.WORKSPACE_TRANSFERS)
+    assert window.tabs.currentIndex() == app_module.TAB_DOWNLOADS
+
+    window.tabs.setCurrentIndex(app_module.TAB_PLAYLIST)
+    assert window.workspace.currentIndex() == WORKSPACE_ACQUIRE
+
+
+def test_editor_tab_shows_empty_state_until_a_song_is_loaded(window):
+    window.tabs.setCurrentIndex(app_module.TAB_SEARCH)
+    window.tabs.setCurrentIndex(app_module.TAB_EDITOR)
+    assert window.workspace.currentIndex() == WORKSPACE_EMPTY
+
+
+def test_downloads_tab_shows_active_count(window):
+    window._on_active_downloads_changed(3)
+    assert window.tabs.tabText(app_module.TAB_DOWNLOADS) == "Downloads (3)"
+    window._on_active_downloads_changed(0)
+    assert window.tabs.tabText(app_module.TAB_DOWNLOADS) == "Downloads"
 
 
 def test_starts_on_the_empty_page_with_no_song_loaded(window):
@@ -117,12 +142,13 @@ def test_open_batch_import_does_not_refetch_while_a_batch_is_active(window, monk
         def isRunning(self) -> bool: return True
         def wait(self, timeout_ms: int) -> bool: return True
 
-    window.download_view._download_thread = _RunningThread()
+    window.download_view._search_thread = _RunningThread()
 
     window._open_batch_import("https://open.spotify.com/playlist/abc")
 
     assert calls == []
     assert window.workspace.currentIndex() == WORKSPACE_ACQUIRE
+    window.download_view._search_thread = None
 
 
 def test_open_batch_import_fetches_normally_when_nothing_is_active(window, monkeypatch):
@@ -150,7 +176,7 @@ def test_download_view_instance_survives_workspace_swaps(window, tmp_path):
         def isRunning(self) -> bool: return True
         def wait(self, timeout_ms: int) -> bool: return True
 
-    view_before._download_thread = _RunningThread()
+    view_before._search_thread = _RunningThread()
 
     f = tmp_path / "song.mp3"
     f.write_bytes(b"")
@@ -164,11 +190,10 @@ def test_download_view_instance_survives_workspace_swaps(window, tmp_path):
     assert window.download_view is view_before
     assert window.workspace.currentIndex() == WORKSPACE_ACQUIRE
     assert view_before._rows == ["fake row standing in for an in-progress track"]
-    assert view_before._download_thread.isRunning() is True
+    assert view_before._search_thread.isRunning() is True
 
-    # Let teardown's stop_thread() proceed cleanly against the real
-    # PlaylistDownloadThread machinery rather than this fake.
-    view_before._download_thread = None
+    # Let teardown's stop_thread() proceed cleanly without this fake.
+    view_before._search_thread = None
 
 
 def test_empty_state_add_music_button_shares_the_sidebars_menu(window):
@@ -269,3 +294,17 @@ def test_on_download_files_ready_switches_songs_when_not_dirty(window, monkeypat
     window._on_download_files_ready([str(new_song)])
 
     assert window.current_file_path == str(new_song)
+
+
+def test_background_song_reload_does_not_leave_the_current_page(window, tmp_path):
+    # Lyrics arriving for the open song (or auto-advance at the end of a
+    # track) must not yank the user off the Search page.
+    f = tmp_path / "song.mp3"
+    f.write_bytes(b"")
+    window._load_song(str(f))
+    window._show_page(app_module.WORKSPACE_SEARCH)
+
+    window._load_song(str(f), keep_playing=True, show_editor=False)
+
+    assert window.workspace.currentIndex() == app_module.WORKSPACE_SEARCH
+    assert window.tabs.currentIndex() == app_module.TAB_SEARCH

@@ -128,11 +128,8 @@ def test_is_batch_active_true_when_search_thread_running(view):
     assert view.is_batch_active() is True
 
 
-def test_is_batch_active_true_when_download_thread_running(view):
-    class _RunningThread:
-        def isRunning(self) -> bool: return True
-
-    view._download_thread = _RunningThread()
+def test_is_batch_active_true_while_its_downloads_are_unfinished(view):
+    view._item_rows = {7: 0}
     assert view.is_batch_active() is True
 
 
@@ -182,3 +179,109 @@ def test_retry_after_failure_starts_from_an_untried_source(view):
 
     assert state.selected is d
     assert view._download_order(state) == [d, a, b, c]
+
+
+# ---------------------------------------------------------------------------
+# Downloads go through the shared engine (TransfersView)
+# ---------------------------------------------------------------------------
+
+class _FakeTransfers:
+    def __init__(self):
+        from PyQt6.QtCore import QObject, pyqtSignal
+
+        class _Signals(QObject):
+            item_changed = pyqtSignal(int, str, int, str)
+            item_source_changed = pyqtSignal(int, object)
+            item_finished = pyqtSignal(int, bool, str, str)
+
+        self.signals = _Signals()
+        self.item_changed = self.signals.item_changed
+        self.item_source_changed = self.signals.item_source_changed
+        self.item_finished = self.signals.item_finished
+        self.enqueued = []
+        self.cancelled = []
+        self._next = 100
+
+    def enqueue(self, files, alternatives=None, queue_patience_s=None):
+        self._next += 1
+        self.enqueued.append((files[0], alternatives(files[0]) if alternatives else [], queue_patience_s))
+        return [self._next]
+
+    def cancel_items(self, ids):
+        self.cancelled.extend(ids)
+
+    def skip_source(self, item_id):
+        pass
+
+
+@pytest.fixture
+def engine_view(qapp, tmp_path, monkeypatch):
+    settings = QSettings(str(tmp_path / "test.ini"), QSettings.Format.IniFormat)
+    import download_view as download_view_module
+    monkeypatch.setattr(download_view_module, "PlaylistFetchThread", _FakeFetchThread)
+    engine = _FakeTransfers()
+    v = DownloadView(settings, get_client=lambda: object(), collect_library_paths=lambda: [],
+                     transfers=engine)
+    return v, engine
+
+
+def test_download_all_enqueues_matched_rows_with_their_fallbacks(engine_view):
+    view, engine = engine_view
+    a, b = _cand("a"), _cand("b")
+    _one_row(view, [a, b])
+
+    view._download_all()
+
+    assert engine.enqueued == [(a, [b], 180.0)]
+    assert view._rows[0].status == "download_queued"
+    assert view.is_batch_active()
+
+
+def test_rows_matched_after_download_all_start_downloading_by_themselves(engine_view):
+    from PyQt6.QtWidgets import QTableWidgetItem
+    from download_view import _RowState
+
+    view, engine = engine_view
+
+    class _T:
+        query = "x"
+
+    view._rows = [_RowState(track=_T(), status="searching")]
+    view.table.setRowCount(1)
+    for col in (0, 1, 2):
+        view.table.setItem(0, col, QTableWidgetItem(""))
+    view._auto_download = True
+
+    view._on_track_matched(0, [_cand("late")])
+
+    assert [e[0].username for e in engine.enqueued] == ["late"]
+
+
+def test_row_mirrors_live_transfer_status_and_result(engine_view):
+    view, engine = engine_view
+    _one_row(view, [_cand("a"), _cand("b")])
+    view._download_row(0)
+    item_id = view._rows[0].item_id
+    done = []
+    view.file_downloaded.connect(done.append)
+
+    engine.item_changed.emit(item_id, "queued", 0, "In a's queue (#3) · 1:10")
+    assert view.table.item(0, 1).text() == "In a's queue (#3) · 1:10"
+
+    engine.item_source_changed.emit(item_id, view._rows[0].candidates[1])
+    assert view._rows[0].selected.username == "b"
+
+    engine.item_finished.emit(item_id, True, "x.mp3", "/lib/x.mp3")
+    assert view._rows[0].status == "downloaded"
+    assert done == ["/lib/x.mp3"]
+    assert not view.is_batch_active()
+
+
+def test_cancel_cancels_this_pages_downloads(engine_view):
+    view, engine = engine_view
+    _one_row(view, [_cand("a")])
+    view._download_row(0)
+
+    view._cancel_current()
+
+    assert engine.cancelled == [view._rows[0].item_id]

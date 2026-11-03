@@ -30,7 +30,7 @@ class _FakeClient:
         self._results_by_query = results_by_query
         self.queries: list[str] = []
 
-    def search(self, query: str) -> list[SoulseekFile]:
+    def search(self, query: str, **_kwargs) -> list[SoulseekFile]:
         self.queries.append(query)
         return self._results_by_query.get(query, [])
 
@@ -61,14 +61,16 @@ def test_clean_query_text_collapses_whitespace():
 # find_best_candidates
 # ---------------------------------------------------------------------------
 
-def test_find_best_candidates_uses_title_only_first():
+def test_find_best_candidates_tries_artist_plus_title_first():
+    # Title alone floods for common names ("Your Love": 9,000+ files from
+    # 250 peers, past slskd's response limit), so the precise query goes first.
     good = _file("Radiohead/OK Computer/03 - Karma Police.mp3")
-    client = _FakeClient({"Karma Police": [good]})
+    client = _FakeClient({"Radiohead Karma Police": [good]})
 
     result = find_best_candidates(client, "Radiohead", "Karma Police")
 
     assert result == [good]
-    assert client.queries == ["Karma Police"]  # never fell back
+    assert client.queries == ["Radiohead Karma Police"]  # never fell back
 
 
 def test_find_best_candidates_falls_back_to_artist_only():
@@ -79,21 +81,29 @@ def test_find_best_candidates_falls_back_to_artist_only():
     result = find_best_candidates(client, "Daft Punk", "Digital Love")
 
     assert result == [good]
-    assert client.queries == ["Digital Love", "Daft Punk"]
+    assert client.queries == ["Daft Punk Digital Love", "Digital Love", "Daft Punk"]
 
 
-def test_find_best_candidates_falls_back_to_combined_query():
-    good = _file("Some Rare Bootleg (Artist X - Title Y).flac")
-    client = _FakeClient({
-        "Title Y": [],
-        "Artist X": [],
-        "Artist X Title Y": [good],
-    })
+def test_find_best_candidates_falls_back_to_title_only():
+    # A peer that spells the artist differently in its folder names.
+    good = _file("AC-DC/Back in Black/06 - Back In Black.mp3")
+    client = _FakeClient({"AC DC Back In Black": [], "Back In Black": [good]})
 
-    result = find_best_candidates(client, "Artist X", "Title Y")
+    result = find_best_candidates(client, "AC/DC", "Back In Black - Remastered")
 
     assert result == [good]
-    assert client.queries == ["Title Y", "Artist X", "Artist X Title Y"]
+    assert client.queries == ["AC DC Back In Black", "Back In Black"]
+
+
+def test_build_queries_uses_primary_artist_and_drops_punctuation():
+    from soulseek import build_queries
+
+    assert build_queries("La Fúmiga, The Tyets", "Cap. 2: Havia de Passar") == [
+        "La Fúmiga Cap 2 Havia de Passar", "Cap 2 Havia de Passar", "La Fúmiga",
+    ]
+    assert build_queries("Gims feat. Maluma", "Hola Señorita (Remix)")[0] == "Gims Hola Señorita"
+    assert build_queries("Paris est Gothique", "Paris est Gothique") == ["Paris est Gothique"]
+    assert build_queries("L'Algérino", "Les Menottes")[0] == "L'Algérino Les Menottes"
 
 
 def test_find_best_candidates_filters_out_unrelated_results():

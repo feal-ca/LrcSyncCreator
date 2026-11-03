@@ -139,7 +139,8 @@ def test_queued_transfer_counts_state_changes_as_progress(monkeypatch, tmp_path)
 
 
 # ---------------------------------------------------------------------------
-# PlaylistDownloadThread — automatic fallback to the row's next candidate
+# TransferThread — automatic fallback to the next candidate (shared by the
+# Search page's downloads and the Playlist page's rows)
 # ---------------------------------------------------------------------------
 
 def _cand(username: str, name: str = "Ma beauté.mp3") -> SoulseekFile:
@@ -171,10 +172,11 @@ class _FallbackClient:
 _REJECTED = {"state": "Completed, Rejected", "exception": "Transfer rejected: File not shared."}
 
 
-def _run_thread(monkeypatch, tmp_path, client, rows, good_peer=None):
+def _run_thread(monkeypatch, tmp_path, client, candidates, good_peer=None, **kwargs):
     clock = _FakeClock()
     monkeypatch.setattr(workers.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(workers.time, "sleep", clock.sleep)
+    monkeypatch.setattr(workers.TransferThread, "STALL_TIMEOUT_S", 60.0)
     downloads = str(tmp_path / "dl")
     os.makedirs(downloads, exist_ok=True)
 
@@ -188,61 +190,88 @@ def _run_thread(monkeypatch, tmp_path, client, rows, good_peer=None):
 
     monkeypatch.setattr(workers, "find_downloaded_file", fake_find)
 
-    thread = workers.PlaylistDownloadThread(
-        client, downloads, str(tmp_path / "lib"), rows, timeout_s=60.0,
-    )
-    attempts, done = [], []
-    thread.track_attempt.connect(lambda row, f: attempts.append((row, f.username)))
-    thread.track_done.connect(lambda row, ok, detail, path: done.append((row, ok, detail)))
+    thread = workers.TransferThread(0, client, downloads, candidates, finalize=lambda p: p, **kwargs)
+    attempts, done, statuses = [], [], []
+    thread.source_changed.connect(lambda _id, f: attempts.append(f.username))
+    thread.status.connect(lambda _id, phase, pct, text: statuses.append((phase, text)))
+    thread.finished_transfer.connect(lambda _id, ok, detail, path: done.append((ok, detail)))
     thread.run()
-    return attempts, done
+    return attempts, done, statuses
 
 
 def test_falls_back_to_next_candidate_after_rejection(monkeypatch, tmp_path):
     client = _FallbackClient({"bad": _REJECTED})
-    rows = [(0, [_cand("bad"), _cand("good")])]
 
-    attempts, done = _run_thread(monkeypatch, tmp_path, client, rows, good_peer="good")
+    attempts, done, _ = _run_thread(monkeypatch, tmp_path, client, [_cand("bad"), _cand("good")], good_peer="good")
 
     assert client.requested == ["bad", "good"]
-    assert attempts == [(0, "bad"), (0, "good")]
-    assert done == [(0, True, "good.mp3")]
+    assert attempts == ["bad", "good"]
+    assert done == [(True, "good.mp3")]
 
 
 def test_stalled_candidate_is_cancelled_before_falling_back(monkeypatch, tmp_path):
     client = _FallbackClient({"stuck": {"state": "InProgress", "bytesTransferred": 100}})
-    rows = [(0, [_cand("stuck"), _cand("good")])]
 
-    _attempts, done = _run_thread(monkeypatch, tmp_path, client, rows, good_peer="good")
+    _attempts, done, _ = _run_thread(monkeypatch, tmp_path, client, [_cand("stuck"), _cand("good")], good_peer="good")
 
     assert client.cancelled == ["stuck"]
-    assert done[-1][1] is True
+    assert done[-1][0] is True
+
+
+def test_peer_that_never_answers_is_abandoned(monkeypatch, tmp_path):
+    # Today's real case: a request that sat in "Requested" for minutes.
+    client = _FallbackClient({"silent": {"state": "Requested"}})
+
+    _attempts, done, statuses = _run_thread(monkeypatch, tmp_path, client, [_cand("silent"), _cand("good")], good_peer="good")
+
+    assert client.requested == ["silent", "good"]
+    assert any("Waiting for silent to answer" in text for _phase, text in statuses)
+    assert done[-1][0] is True
+
+
+def test_long_peer_queue_moves_on_only_with_patience_set(monkeypatch, tmp_path):
+    queued = {"state": "Queued, Remotely", "placeInQueue": 40}
+    client = _FallbackClient({"busy": queued})
+
+    _a, done, statuses = _run_thread(
+        monkeypatch, tmp_path, client, [_cand("busy"), _cand("good")], good_peer="good",
+        queue_patience_s=120.0,
+    )
+
+    assert client.requested == ["busy", "good"]
+    assert ("queued", "In busy's queue (#40) · 0:00") in statuses
+    assert done[-1][0] is True
 
 
 def test_skips_other_files_from_a_peer_that_already_failed(monkeypatch, tmp_path):
     client = _FallbackClient({"bad": _REJECTED})
-    rows = [(0, [_cand("bad", "a.mp3"), _cand("bad", "b.mp3"), _cand("good")])]
 
-    _run_thread(monkeypatch, tmp_path, client, rows, good_peer="good")
+    _run_thread(monkeypatch, tmp_path, client, [_cand("bad", "a.mp3"), _cand("bad", "b.mp3"), _cand("good")], good_peer="good")
 
     assert client.requested == ["bad", "good"]
 
 
 def test_reports_every_failure_when_all_candidates_fail(monkeypatch, tmp_path):
     client = _FallbackClient({"a": _REJECTED, "b": _REJECTED})
-    rows = [(0, [_cand("a"), _cand("b")])]
 
-    _attempts, done = _run_thread(monkeypatch, tmp_path, client, rows)
+    _attempts, done, _ = _run_thread(monkeypatch, tmp_path, client, [_cand("a"), _cand("b")])
 
-    (row, ok, detail), = done
+    (ok, detail), = done
     assert not ok
     assert "2 sources" in detail and "File not shared" in detail
 
 
 def test_gives_up_after_max_attempts(monkeypatch, tmp_path):
     client = _FallbackClient({u: _REJECTED for u in "abcdef"})
-    rows = [(0, [_cand(u) for u in "abcdef"])]
 
-    _run_thread(monkeypatch, tmp_path, client, rows)
+    _run_thread(monkeypatch, tmp_path, client, [_cand(u) for u in "abcdef"])
 
     assert client.requested == list("abc")
+
+
+def test_describe_transfer_shows_speed_and_time_left():
+    f = _cand("p")
+    phase, pct, text = workers.describe_transfer(f, "InProgress", _SIZE // 2, None, 200 * 1024, 30)
+    assert (phase, pct) == ("downloading", 50)
+    assert text.startswith("50% · 200 KB/s · ")
+    assert text.endswith(" left")
