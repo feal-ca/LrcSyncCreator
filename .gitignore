@@ -7,3 +7,11 @@ M/
 # slskd is downloaded locally by scripts/setup_slskd.sh, and its config
 # holds your Soulseek account credentials + API key — never commit it.
 slskd-bin/
+
+# Local screenshots and design prototypes (not referenced by README.md).
+/LrcApp.png
+/LrcApp2.png
+/icon.png
+/website.png
+/prototip*.png
+/shape.svg
