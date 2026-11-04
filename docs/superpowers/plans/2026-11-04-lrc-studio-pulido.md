@@ -86,7 +86,9 @@ Detailed from the aioslsk research report. Outline:
 
 ## Phase C: lyrics sources
 
-Detailed from the lyrics-provider research report. Outline: providers module, NetEase credit-line stripping, cross-checking, strict auto-fetch (only verified matches are written), picker searches every source in one pass, plain lyrics only upgrade to synced.
+Detailed from the lyrics-provider research report. Outline: providers module, NetEase credit-line stripping, cross-checking to pick the best candidate, picker searches every source in one pass, plain lyrics only upgrade to synced.
+
+User ruling (2026-11-04): auto-fetch must NOT become stricter than today; the goal is MORE songs with lyrics. Extra providers raise coverage, cross-checking chooses among candidates, and only clearly broken results are dropped (credit-line junk, decoys, timing past the end of the song, a different song entirely). Plain lyrics are still saved when nothing synced exists, as today.
 
 ## Phase D: verified bugs and speed findings from the code critique
 
