@@ -233,10 +233,16 @@ class LibraryPanel(QWidget):
     def load_library_folder(self) -> int:
         """Show every audio file in the library folder. Returns how many
         rows appeared. Files that vanished from disk are dropped."""
-        gone = [p for p in self._items if not os.path.exists(p)]
-        self._remove_items(gone)
         root = self.library_dir()
-        scanned = scan_audio_files(root) if root and os.path.isdir(root) else []
+        gone = [p for p in self._items if not os.path.exists(p)]
+        if not root or not os.path.isdir(root):
+            # Folder unavailable (a drive not mounted yet): hide the rows but
+            # keep their history, or every song would come back as "new".
+            self._remove_items(gone, forget=False)
+            self._refresh_placeholder()
+            return 0
+        self._remove_items(gone)
+        scanned = scan_audio_files(root)
         before = len(self._items)
         self._index.sync(sorted(set(self._items) | set(scanned)))
         self._add_items(scanned)
@@ -272,12 +278,13 @@ class LibraryPanel(QWidget):
         self._refresh_placeholder()
         self._apply_filter()
 
-    def _remove_items(self, paths: list[str]) -> None:
+    def _remove_items(self, paths: list[str], forget: bool = True) -> None:
         for path in paths:
             item = self._items.pop(path, None)
             if item is not None:
                 self.file_list.takeItem(self.file_list.row(item))
-            self._index.forget(path)
+            if forget:
+                self._index.forget(path)
 
     def _save_index(self) -> None:
         try:

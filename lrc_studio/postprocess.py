@@ -72,6 +72,10 @@ def library_stem(path: str) -> str:
     return clean_filename(strip_track_number(stem)).strip(" .") or stem
 
 
+# Files that pair with a song by stem: any audio file, and its lyrics.
+_PAIRED_EXTENSIONS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aiff", ".aif", ".ape", ".wv", ".lrc")
+
+
 @dataclass
 class RenamePlan:
     """One file's standardized name: *new* is None when it stays as it is,
@@ -87,19 +91,27 @@ def plan_standard_names(paths: list[str]) -> list[RenamePlan]:
     order. Nothing is touched; a name that would collide with a file on
     disk, or with an earlier plan in the same batch, is left alone."""
     plans: list[RenamePlan] = []
-    claimed: set[str] = set()
+    claimed: set[str] = set()          # folder/stem: songs pair with lyrics by stem
     for old in paths:
         stem = tag_based_stem(old)
         if not stem:
             plans.append(RenamePlan(old, None, "No artist/title tags"))
             continue
-        new = os.path.join(os.path.dirname(old), stem + os.path.splitext(old)[1])
+        folder = os.path.dirname(old)
+        new = os.path.join(folder, stem + os.path.splitext(old)[1])
         if new == old:
             plans.append(RenamePlan(old, None, "Already named that way"))
-        elif new in claimed or os.path.exists(new):
-            plans.append(RenamePlan(old, None, f"“{os.path.basename(new)}” already exists"))
+            continue
+        key = os.path.join(folder, stem).lower()
+        # Another file already using that name (any audio format, or its
+        # .lrc) would share or hand over lyrics: leave this one alone.
+        taken = key in claimed or any(
+            os.path.exists(os.path.join(folder, stem + ext)) for ext in _PAIRED_EXTENSIONS
+        )
+        if taken:
+            plans.append(RenamePlan(old, None, f"“{stem}” is already used by another file"))
         else:
-            claimed.add(new)
+            claimed.add(key)
             plans.append(RenamePlan(old, new, ""))
     return plans
 

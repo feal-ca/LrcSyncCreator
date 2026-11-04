@@ -177,6 +177,8 @@ class LrcSyncApp(QMainWindow):
         self._slsk: SlskClient | None = None
         self._slsk_thread: threading.Thread | None = None
         self._slsk_error = ""
+        self._slsk_waiting = False      # a _get_slsk_client() is pumping events
+        self._closing = False
 
         # Unsaved-changes tracking — drives the save-before-switch/close prompt.
         self._dirty: bool = False
@@ -978,6 +980,7 @@ class LrcSyncApp(QMainWindow):
         del self._verses[len(lines):]
         self._undo_stack.clear()
         self._playback_highlight_verse = None
+        self._active_verse = None
         self.current_verse_index = 0
         for i, (ts_str, content) in enumerate(lines):
             if i < len(self._verses):
@@ -1016,11 +1019,14 @@ class LrcSyncApp(QMainWindow):
             return
         index = max(0, min(index, len(self._verses) - 1))
         # Only the old and the new row change; restyling every row on each
-        # key press made S and Up/Down take ~100 ms.
-        old = self.current_verse_index
-        if 0 <= old < len(self._verses) and old != index:
-            self._verses[old].set_active(False)
-        self._verses[index].set_active(True)
+        # key press made S and Up/Down take ~100 ms. The old row is tracked
+        # by object: deleting or inserting lines shifts indexes.
+        new = self._verses[index]
+        previous = getattr(self, "_active_verse", None)
+        if previous is not None and previous is not new:
+            previous.set_active(False)
+        new.set_active(True)
+        self._active_verse = new
         self.scroll_area.ensureWidgetVisible(self._verses[index], 0, 300)
         self.current_verse_index = index
         self.timeline.set_active_index(index)
@@ -1524,6 +1530,11 @@ class LrcSyncApp(QMainWindow):
         when there's no account or the login failed."""
         if self._slsk is not None and self._slsk.check_connection()[0]:
             return self._slsk
+        if self._slsk_waiting:
+            # Asked again while the first request is still waiting (Enter
+            # pressed twice): that one reports the outcome.
+            self.status_bar.setText("Still connecting to Soulseek…")
+            return None
         if self._slsk is None and self._build_slsk_client() is None:
             QMessageBox.information(
                 self, "Soulseek Account Needed",
@@ -1535,9 +1546,15 @@ class LrcSyncApp(QMainWindow):
         self._start_slsk_connect()
         self.status_bar.setText("Connecting to Soulseek…")
         thread = self._slsk_thread
-        while thread is not None and thread.is_alive():
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
-            thread.join(0.05)
+        self._slsk_waiting = True
+        try:
+            while thread is not None and thread.is_alive():
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
+                thread.join(0.05)
+        finally:
+            self._slsk_waiting = False
+        if self._closing:
+            return None
         self._refresh_slsk_status()
         if self._slsk is not None and self._slsk.check_connection()[0]:
             self.status_bar.setText("Connected to Soulseek.")
@@ -1763,6 +1780,7 @@ class LrcSyncApp(QMainWindow):
                 return
             self._convert_thread.request_cancel()
             self._convert_thread.wait(10_000)
+        self._closing = True
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
 
@@ -1809,6 +1827,14 @@ class LrcSyncApp(QMainWindow):
             self.current_file_path = new_path
             self.song_filename = os.path.basename(new_path)
             self.file_label.setText(os.path.splitext(self.song_filename)[0])
+            # VLC opens files lazily: left on the old path, the next Play
+            # would fail, report "Ended" and auto-advance to another song.
+            pos = self.player.get_time()
+            was_playing = bool(self.player.is_playing())
+            self.player.set_media(self._vlc.media_new(new_path))
+            if was_playing:
+                self.player.play()
+                QTimer.singleShot(300, lambda: self.player.set_time(max(0, pos)))
 
     def _load_file_from_index(self, index: int) -> None:
         paths = self.library_panel.real_file_paths()

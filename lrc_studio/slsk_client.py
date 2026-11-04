@@ -331,6 +331,7 @@ class SlskClient:
         if not self._thread.is_alive():
             return
         self._closing = True
+        self._status = "Disconnected from Soulseek."
 
         async def stop():
             if self._reconnect_task:

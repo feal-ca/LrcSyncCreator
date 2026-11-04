@@ -610,10 +610,11 @@ class SearchView(QWidget):
         self._dirty = False
         self._index.set_filter(self.filter_input.text(), self.lossless_check.isChecked())
         current = self.tree.currentItem()
-        keep_id = None
+        keep_id = keep_copy = None
         if current is not None:
             top = current if current.parent() is None else current.parent()
             keep_id = top.data(0, _VERSION_ROLE)
+            keep_copy = current.data(0, _COPY_ROLE)
         expanded = {
             self.tree.topLevelItem(i).data(0, _VERSION_ROLE)
             for i in range(self.tree.topLevelItemCount())
@@ -633,6 +634,14 @@ class SearchView(QWidget):
                     select = item
             if select is None and self.tree.topLevelItemCount() and not self._user_picked:
                 select = self.tree.topLevelItem(0)
+            if select is not None and keep_copy:
+                # The user picked a particular copy: keep exactly that one.
+                select.setExpanded(True)
+                self._fill_copies(select)
+                for i in range(select.childCount()):
+                    if select.child(i).data(0, _COPY_ROLE) == keep_copy:
+                        select = select.child(i)
+                        break
             if select is not None:
                 self.tree.setCurrentItem(select)
             self.tree.verticalScrollBar().setValue(scroll)
@@ -687,6 +696,14 @@ class SearchView(QWidget):
             for col in range(len(_S_HEADERS)):
                 child.setForeground(col, QColor(theme.TEXT_2))
             item.addChild(child)
+
+    def _set_expanded(self, version_id: int, expanded: bool) -> None:
+        """By id: the item the menu was opened on may have been rebuilt."""
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, _VERSION_ROLE) == version_id:
+                item.setExpanded(expanded)
+                return
 
     def _version_by_id(self, version_id) -> SongVersion | None:
         return next((v for v in self._index.ranked() if v.id == version_id), None)
@@ -809,17 +826,19 @@ class SearchView(QWidget):
             return
         menu = QMenu(self)
         is_copy = item.parent() is not None
-        download = menu.addAction("Download This Copy" if is_copy else "Download", self.download_selected)
+        download = menu.addAction("Download This Copy" if is_copy else "Download",
+                                  lambda f=chosen: self.download_requested.emit([f]))
         download.setShortcut(QKeySequence("Return"))
         album = menu.addAction(
-            f"Download Album “{chosen.folder_name or '/'}” from {chosen.username}", self.download_selected_album,
+            f"Download Album “{chosen.folder_name or '/'}” from {chosen.username}",
+            lambda f=chosen: self.download_folder(f),
         )
         album.setShortcut(QKeySequence("Shift+Return"))
         menu.addSeparator()
         if not is_copy:
-            top = item
-            menu.addAction("Hide Copies" if top.isExpanded() else f"Show the {len(version.copies)} Copies",
-                           lambda: top.setExpanded(not top.isExpanded()))
+            expanded = item.isExpanded()
+            menu.addAction("Hide Copies" if expanded else f"Show the {len(version.copies)} Copies",
+                           lambda vid=version.id, e=expanded: self._set_expanded(vid, not e))
         menu.addAction(f"Show Only Files from {chosen.username}",
                        lambda: self.filter_input.setText(f'"{chosen.username}"'))
         menu.addAction("Copy Remote Path", lambda: QGuiApplication.clipboard().setText(chosen.filename))

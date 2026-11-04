@@ -238,12 +238,13 @@ class TransfersView(QWidget):
         free = MAX_ACTIVE - len(self._threads)
         if not waiting or free <= 0:
             return
+        # Ask every time: the window may have replaced the client (a new
+        # account in Settings) and the old one is closed. Cheap when online.
+        self._client = self._get_client()
         if self._client is None:
-            self._client = self._get_client()
-            if self._client is None:
-                for item in waiting:
-                    self._set_phase(item, "failed", -1, "Not connected to Soulseek")
-                return
+            for item in waiting:
+                self._set_phase(item, "failed", -1, "Not connected to Soulseek")
+            return
 
         downloads_dir = downloads_dir_from_settings(self._settings)
         options = options_from_settings(self._settings)

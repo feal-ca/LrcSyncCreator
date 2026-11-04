@@ -34,6 +34,9 @@ class LibraryIndex:
             with open(self._path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, ValueError):
+            # Unreadable: start over as on a first run (seed from mtimes),
+            # rather than marking the whole library "new".
+            self._exists = False
             return
         if isinstance(data, dict):
             for path, entry in data.items():
