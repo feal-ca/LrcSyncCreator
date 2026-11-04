@@ -1,0 +1,7 @@
+PyQt6>=6.10,<7
+python-vlc>=3.0,<4
+mutagen>=1.47,<2
+syncedlyrics>=1.0,<2
+requests>=2.32,<3
+rapidfuzz>=3.14,<4
+aioslsk==1.7.1   # in-process Soulseek client; pinned, slsk_client.py works around 1.7.1 internals

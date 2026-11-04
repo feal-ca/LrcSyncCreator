@@ -1,0 +1,14 @@
+# Optional extras — the app runs fine without these.
+#
+# faster-whisper: powers Tools -> Validate Sync (a local, offline spot-check
+# of a few lines' lyrics/timing against the audio). Not installed by default
+# since it pulls in a speech-recognition backend and downloads a model
+# (~150MB) on first use. Install with:
+#
+#   pip install -r requirements-optional.txt
+#
+faster-whisper>=1.2,<2
+
+# ytmusicapi: lets "Find lyrics" also ask YouTube Music (Settings → Downloads),
+# which covers more Spanish and Catalan songs. Unofficial API, off by default.
+ytmusicapi>=1.12,<2
