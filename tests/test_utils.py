@@ -160,3 +160,38 @@ def test_analyze_lrc_status_no_timestamps_at_all(tmp_path):
     path = tmp_path / "notags.lrc"
     path.write_text("Just plain text, no LRC tags at all.")
     assert analyze_lrc_status(str(path)) == COLOR_UNSYNCED
+
+
+# -- Artist/title tags (library "Edit Artist & Title…") ----------------------
+
+import shutil as _shutil
+import subprocess as _subprocess
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("ext", [".mp3", ".opus", ".flac"])
+def test_write_then_read_artist_title(tmp_path, ext):
+    if _shutil.which("ffmpeg") is None:
+        _pytest.skip("needs ffmpeg")
+    from utils import read_artist_title, write_artist_title
+
+    path = str(tmp_path / f"song{ext}")
+    _subprocess.run(
+        ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono",
+         "-t", "0.5", path],
+        check=True,
+    )
+    assert read_artist_title(path) == ("", "")
+
+    write_artist_title(path, "Rosalía", "Malamente")
+
+    assert read_artist_title(path) == ("Rosalía", "Malamente")
+
+
+def test_read_artist_title_of_a_non_audio_file_is_empty(tmp_path):
+    from utils import read_artist_title
+
+    junk = tmp_path / "junk.mp3"
+    junk.write_bytes(b"not audio")
+    assert read_artist_title(str(junk)) == ("", "")

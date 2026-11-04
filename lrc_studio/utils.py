@@ -249,3 +249,38 @@ def write_embedded_lyrics(file_path: str, lrc_text: str) -> None:
 
     else:
         raise ValueError(f"Embedding lyrics is not supported for {ext} files.")
+
+
+# ---------------------------------------------------------------------------
+# Artist / title tags (library "Edit Artist & Title…")
+# ---------------------------------------------------------------------------
+
+def read_artist_title(path: str) -> tuple[str, str]:
+    """The file's artist and title tags, ("", "") when it has none or
+    can't be read."""
+    import mutagen
+
+    try:
+        audio = mutagen.File(path, easy=True)
+    except Exception:
+        return "", ""
+    if audio is None or audio.tags is None:
+        return "", ""
+    artist = (audio.get("artist") or [""])[0].strip()
+    title = (audio.get("title") or [""])[0].strip()
+    return artist, title
+
+
+def write_artist_title(path: str, artist: str, title: str) -> None:
+    """Set the artist and title tags, keeping every other tag. Raises on
+    files mutagen can't tag."""
+    import mutagen
+
+    audio = mutagen.File(path, easy=True)
+    if audio is None:
+        raise ValueError(f"Not an audio file mutagen can tag: {os.path.basename(path)}")
+    if audio.tags is None:
+        audio.add_tags()
+    audio["artist"] = [artist.strip()]
+    audio["title"] = [title.strip()]
+    audio.save()

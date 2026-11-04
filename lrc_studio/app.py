@@ -27,13 +27,13 @@ from dataclasses import dataclass
 from functools import partial
 
 import vlc
-from PyQt6.QtCore import Qt, QSettings, QTimer
+from PyQt6.QtCore import QFile, Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout,
+    QApplication, QComboBox, QDialog, QFrame, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton,
-    QScrollArea, QSlider, QSplitter, QStackedWidget, QTabBar, QToolButton,
+    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QScrollArea, QSlider, QSplitter, QStackedWidget, QTabBar,
     QVBoxLayout, QWidget,
 )
 
@@ -84,7 +84,7 @@ class _Command:
     label: str                        # menu text, e.g. "Add Files…"
     shortcut: str | None              # e.g. "Ctrl+S", or None
     handler: Callable[[], None]
-    menu: str | None                  # "file" | "edit" | "tools" | "help" | None
+    menu: str | None                  # "file" | "lyrics" | "help" | None (shortcut only)
     help_text: str | None = None      # Help-dialog phrasing; defaults to *label*
     separator_before: bool = False    # start a new group within its menu
 
@@ -96,12 +96,13 @@ WORKSPACE_EMPTY = 2
 WORKSPACE_SEARCH = 3
 WORKSPACE_TRANSFERS = 4
 
-# Tabs above the workspace, in order.
-TAB_EDITOR, TAB_SEARCH, TAB_DOWNLOADS, TAB_PLAYLIST = range(4)
+# Tabs above the workspace, in order. A pasted Spotify link opens its
+# review page under the Search tab.
+TAB_EDITOR, TAB_SEARCH, TAB_DOWNLOADS = range(3)
 _PAGE_TO_TAB = {
     WORKSPACE_EDITOR: TAB_EDITOR, WORKSPACE_EMPTY: TAB_EDITOR,
     WORKSPACE_SEARCH: TAB_SEARCH, WORKSPACE_TRANSFERS: TAB_DOWNLOADS,
-    WORKSPACE_ACQUIRE: TAB_PLAYLIST,
+    WORKSPACE_ACQUIRE: TAB_SEARCH,
 }
 
 
@@ -313,9 +314,10 @@ class LrcSyncApp(QMainWindow):
         self.library_panel.setMinimumWidth(240)
         self.library_panel.song_selected.connect(self._on_library_song_selected)
         self.library_panel.file_renamed.connect(self._on_file_renamed)
-        self.library_panel.find_music_requested.connect(self._find_music)
-        self.library_panel.fetch_missing_lyrics_requested.connect(self._batch_download_lyrics)
-        self.library_panel.convert_library_requested.connect(self._convert_library)
+        self.library_panel.lyrics_requested.connect(self._fetch_lyrics_for)
+        self.library_panel.lyrics_picker_requested.connect(self._open_lyrics_picker_for)
+        self.library_panel.convert_requested.connect(self._convert_files)
+        self.library_panel.trash_requested.connect(self._trash_files)
         self.splitter.addWidget(self.library_panel)
 
         right = QWidget()
@@ -326,10 +328,10 @@ class LrcSyncApp(QMainWindow):
         self.tabs = QTabBar()
         self.tabs.setDrawBase(False)
         self.tabs.setExpanding(False)
-        for label in ("Editor", "Search", "Downloads", "Playlist"):
+        for label in ("Editor", "Search", "Downloads"):
             self.tabs.addTab(label)
-        self.tabs.setTabToolTip(TAB_SEARCH, "Search Soulseek (Ctrl+F)")
-        self.tabs.setTabToolTip(TAB_PLAYLIST, "Import a Spotify track, album or playlist")
+        self.tabs.setTabToolTip(TAB_SEARCH, "Search Soulseek, or paste a Spotify link (Ctrl+F)")
+        self.tabs.setTabToolTip(TAB_DOWNLOADS, "Downloads in progress and finished (Ctrl+J)")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         right_layout.addWidget(self.tabs)
 
@@ -349,6 +351,7 @@ class LrcSyncApp(QMainWindow):
         self.download_view.files_ready.connect(self._on_download_files_ready)
         self.download_view.file_downloaded.connect(self.library_panel.add_files_single)
         self.download_view.open_in_library.connect(self._open_in_library)
+        self.download_view.back_requested.connect(lambda: self._show_page(WORKSPACE_SEARCH))
         self.workspace.addWidget(self.download_view)               # WORKSPACE_ACQUIRE = 1
 
         self.workspace.addWidget(self._build_empty_state())         # WORKSPACE_EMPTY = 2
@@ -395,30 +398,17 @@ class LrcSyncApp(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.addStretch(2)
-
-        title = QLabel("Pick a song to sync")
+        title = QLabel("Open a song to edit its lyrics")
         title.setProperty("role", "title")
         layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignHCenter)
         label = QLabel(
-            "Double-click a song in your library to open it here.\n"
-            "Hollow dots are songs without lyrics yet."
+            "Double-click a song in your library. New songs are on top, tagged \u201cnew\u201d.\n"
+            "Right-click songs for everything else. Ctrl+F finds music on Soulseek."
         )
         label.setProperty("role", "muted")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addSpacing(4)
         layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignHCenter)
-        layout.addSpacing(14)
-
-        # Shares the sidebar's own QMenu object (Add Files / Find Music)
-        # rather than a second, hand-built equivalent — the two can never
-        # drift apart, and a zero-state user with local files still has
-        # "Add Files" reachable from here, not just Find Music.
-        self._empty_state_add_music_button = QToolButton()
-        self._empty_state_add_music_button.setText("Add music")
-        self._empty_state_add_music_button.setProperty("variant", "primary")
-        self._empty_state_add_music_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self._empty_state_add_music_button.setMenu(self.library_panel.add_music_button.menu())
-        layout.addWidget(self._empty_state_add_music_button, alignment=Qt.AlignmentFlag.AlignCenter)
         layout.addStretch(3)
         return page
 
@@ -466,25 +456,21 @@ class LrcSyncApp(QMainWindow):
 
             # self.library_panel doesn't exist yet at _build_commands() time
             # (it's constructed later in _init_ui) — lazy lookup via lambda.
-            _Command("Add Files…", "Ctrl+O", lambda: self.library_panel.open_add_files_dialog(), "file"),
-            _Command("Save LRC", "Ctrl+S", self._save_lrc_file, "file"),
-            _Command("Rescan Library Folder", None, self._load_library, "file"),
-            _Command("Exit", "Ctrl+Q", self.close, "file", separator_before=True),
+            _Command("Settings…", "Ctrl+,", self._open_settings_dialog, "file"),
+            _Command("Rescan Library", "F5", self._load_library, "file"),
+            _Command("Quit", "Ctrl+Q", self.close, "file", separator_before=True),
 
-            _Command("Undo Sync", "Ctrl+Z", self._undo_last_sync, "edit"),
-            _Command("Sort Lines by Time", "Ctrl+T", self._sort_verses_by_time, "edit"),
-            _Command("Shift All Timestamps…", "Ctrl+Shift+O", self._shift_all_timestamps, "edit"),
-            _Command("Get Lyrics…", "Ctrl+L", self._get_lyrics_online, "edit"),
-            _Command("Clear All Lyrics", None, self._clear_lyrics, "edit", separator_before=True),
+            _Command("Save Lyrics", "Ctrl+S", self._save_lrc_file, "lyrics"),
+            _Command("Undo", "Ctrl+Z", self._undo_last_sync, "lyrics"),
+            _Command("Find Lyrics…", "Ctrl+L", self._find_lyrics_command, "lyrics", separator_before=True,
+                     help_text="Find lyrics (the open song, or the songs selected in the library)"),
+            _Command("Shift Timing…", "Ctrl+Shift+O", self._shift_all_timestamps, "lyrics"),
+            _Command("Sort Lines by Time", "Ctrl+T", self._sort_verses_by_time, "lyrics"),
+            _Command("Check Sync…", None, self._validate_sync, "lyrics"),
+            _Command("Clear Lyrics…", None, self._clear_lyrics, "lyrics", separator_before=True),
 
-            _Command("Find Music…", "Ctrl+F", self._find_music, "tools"),
-            _Command("Downloads", "Ctrl+J", lambda: self._show_page(WORKSPACE_TRANSFERS), "tools"),
-            _Command("Fetch Lyrics for All Missing", None,
-                     lambda: self._batch_download_lyrics(self.library_panel.paths_with_status("missing")), "tools",
-                     separator_before=True),
-            _Command("Convert Lossless Files to Opus…", None, self._convert_library, "tools"),
-            _Command("Validate Sync…", None, self._validate_sync, "tools"),
-            _Command("Settings…", "Ctrl+,", self._open_settings_dialog, "tools", separator_before=True),
+            _Command("Search Soulseek", "Ctrl+F", self._find_music, None),
+            _Command("Downloads", "Ctrl+J", lambda: self._show_page(WORKSPACE_TRANSFERS), None),
 
             _Command("Keyboard Shortcuts…", None, self._show_shortcuts_dialog, "help"),
             _Command("About LRC Studio", None, self._show_about_dialog, "help"),
@@ -493,11 +479,14 @@ class LrcSyncApp(QMainWindow):
     def _build_menu_bar(self) -> None:
         menu_bar = self.menuBar()
         menus = {
-            "file":  menu_bar.addMenu("&File"),
-            "edit":  menu_bar.addMenu("&Edit"),
-            "tools": menu_bar.addMenu("&Tools"),
-            "help":  menu_bar.addMenu("&Help"),
+            "file":   menu_bar.addMenu("&File"),
+            "lyrics": menu_bar.addMenu("&Lyrics"),
         }
+        # Library: the right-click menu for whatever is selected, rebuilt
+        # each time it opens so it always matches the selection.
+        self.library_menu = menu_bar.addMenu("Li&brary")
+        self.library_menu.aboutToShow.connect(self._fill_library_menu)
+        menus["help"] = menu_bar.addMenu("&Help")
         for cmd in self._commands:
             if cmd.menu is None:
                 continue
@@ -631,9 +620,6 @@ class LrcSyncApp(QMainWindow):
             self.search_view.focus_query()
         elif tab == TAB_DOWNLOADS:
             self.workspace.setCurrentIndex(WORKSPACE_TRANSFERS)
-        elif tab == TAB_PLAYLIST:
-            self.workspace.setCurrentIndex(WORKSPACE_ACQUIRE)
-            self.download_view.link_input.setFocus()
 
     def _on_active_downloads_changed(self, n: int) -> None:
         self.tabs.setTabText(TAB_DOWNLOADS, f"Downloads ({n})" if n else "Downloads")
@@ -671,6 +657,22 @@ class LrcSyncApp(QMainWindow):
         self.timeline.seek_requested.connect(self.set_position)
         layout.addWidget(self.timeline)
 
+        # Shown instead of a bare empty line when the song has no lyrics yet.
+        self.no_lyrics_card = QFrame()
+        self.no_lyrics_card.setObjectName("NoLyricsCard")
+        card = QHBoxLayout(self.no_lyrics_card)
+        card.setContentsMargins(16, 12, 16, 12)
+        card_text = QLabel("Find them online, or type them below line by line (Enter moves on).")
+        card_text.setWordWrap(True)
+        card_text.setProperty("role", "muted")
+        card.addWidget(card_text, stretch=1)
+        self.no_lyrics_button = QPushButton("Find lyrics")
+        self.no_lyrics_button.setProperty("variant", "primary")
+        self.no_lyrics_button.clicked.connect(self._get_lyrics_online)
+        card.addWidget(self.no_lyrics_button)
+        self.no_lyrics_card.setVisible(False)
+        layout.addWidget(self.no_lyrics_card)
+
         # Scrollable verse list
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -682,37 +684,25 @@ class LrcSyncApp(QMainWindow):
         self.scroll_area.setWidget(self._scroll_content)
         layout.addWidget(self.scroll_area, stretch=1)
 
-        # ── Actions: Save is the one primary; Clear All sits apart ────
+        # ── Actions: Save is the one primary; Clear all sits apart ────
         actions = QHBoxLayout()
         actions.setSpacing(8)
         save_btn = QPushButton("Save")
-        save_btn.setToolTip("Save the .lrc file next to the song (Ctrl+S)")
+        save_btn.setToolTip("Save the lyrics next to the song (Ctrl+S)")
         save_btn.setProperty("variant", "primary")
         save_btn.clicked.connect(self._save_lrc_file)
         actions.addWidget(save_btn)
 
         for label, handler, tooltip in [
-            ("Get lyrics…", self._get_lyrics_online,
+            ("Find lyrics…", self._get_lyrics_online,
              "Look this song up online and pick the best version (Ctrl+L)"),
-            ("Sort lines", self._sort_verses_by_time,
-             "Reorder lines by their timestamp (Ctrl+T)"),
-            ("Shift all…", self._shift_all_timestamps,
-             "Move every timestamp by the same amount, for lyrics that are consistently early or late"),
+            ("Shift timing…", self._shift_all_timestamps,
+             "Move every line earlier or later by the same amount (Ctrl+Shift+O)"),
         ]:
             btn = QPushButton(label)
             btn.setToolTip(tooltip)
             btn.clicked.connect(handler)
             actions.addWidget(btn)
-
-        # Optional: also write lyrics into the audio file's own tags on save.
-        self.embed_checkbox = QCheckBox("Embed in file tags")
-        self.embed_checkbox.setToolTip("Also write the lyrics into the audio file, so phones and players show them")
-        self.embed_checkbox.setChecked(_as_bool(self.settings.value("embed_lyrics", False), False))
-        self.embed_checkbox.toggled.connect(
-            lambda checked: self.settings.setValue("embed_lyrics", checked)
-        )
-        actions.addSpacing(8)
-        actions.addWidget(self.embed_checkbox)
         actions.addStretch(1)
 
         clear_btn = QPushButton("Clear all")
@@ -938,6 +928,7 @@ class LrcSyncApp(QMainWindow):
             self._add_verse(ts_str, content)
         self._update_timeline()
         self._mark_dirty()
+        self._update_no_lyrics_card()
 
     def _clear_lyrics(self) -> None:
         # The one action in the app with no undo path at all — unlike a
@@ -1094,7 +1085,7 @@ class LrcSyncApp(QMainWindow):
             return
 
         status = f"Saved: {os.path.basename(lrc_path)}"
-        if self.embed_checkbox.isChecked():
+        if _as_bool(self.settings.value("embed_lyrics", False), False):
             try:
                 write_embedded_lyrics(self.current_file_path, lrc_text)
                 status += " (+ embedded in file tags)"
@@ -1123,7 +1114,8 @@ class LrcSyncApp(QMainWindow):
             self._replace_all_verses([])
             self._parse_and_add_lyrics(result)
             self._mark_dirty()
-            self.status_bar.setText("Lyrics found!")
+            self._update_no_lyrics_card()
+            self.status_bar.setText("Lyrics found. Check them and press Ctrl+S to save.")
         else:
             QMessageBox.information(self, "Sorry", "No lyrics found.")
             self.status_bar.setText("Ready")
@@ -1217,7 +1209,8 @@ class LrcSyncApp(QMainWindow):
     # Library conversion (lossless -> Opus, in place)
     # ==================================================================
 
-    def _convert_library(self) -> None:
+    def _convert_files(self, files: list[str]) -> None:
+        """Convert the given lossless library files to Opus, in place."""
         import convert
 
         if self._convert_thread is not None and self._convert_thread.isRunning():
@@ -1227,27 +1220,20 @@ class LrcSyncApp(QMainWindow):
             QMessageBox.warning(self, "ffmpeg Not Found",
                                 "Converting needs ffmpeg on your PATH (e.g. dnf install ffmpeg).")
             return
-        library_dir = self.library_panel.library_dir()
-        if not library_dir or not os.path.isdir(library_dir):
-            QMessageBox.information(self, "No Library Folder",
-                                    "Set your music folder in Tools → Settings first.")
-            return
-        files = convert.find_lossless_files(library_dir)
+        files = [f for f in files if os.path.exists(f)]
         if not files:
-            QMessageBox.information(self, "Nothing to Convert",
-                                    f"No FLAC, WAV or ALAC files in {library_dir}.")
             return
-        size_gb = sum(os.path.getsize(f) for f in files if os.path.exists(f)) / 1024 ** 3
+        size_gb = sum(os.path.getsize(f) for f in files) / 1024 ** 3
         try:
             bitrate = int(self.settings.value("opus_bitrate", 192) or 192)
         except (TypeError, ValueError):
             bitrate = 192
         resp = QMessageBox.warning(
-            self, "Convert Lossless Files to Opus",
-            f"Convert {len(files)} lossless files ({size_gb:.1f} GB) in {library_dir} "
-            f"to Opus {bitrate} kbps?\n\n"
+            self, "Convert to Opus",
+            f"Convert {len(files)} lossless file{'s' if len(files) != 1 else ''} "
+            f"({size_gb:.1f} GB) to Opus {bitrate} kbps?\n\n"
             "Each original is deleted once its Opus copy is written and checked. Tags, "
-            "cover art and .lrc files are kept. This can't be undone, and any device that "
+            "cover art and lyrics are kept. This can't be undone, and any device that "
             "syncs this folder will see the originals disappear.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
@@ -1266,6 +1252,101 @@ class LrcSyncApp(QMainWindow):
         self._convert_thread.converted.connect(self._on_file_converted)
         self._convert_thread.finished_all.connect(self._on_convert_finished)
         self._convert_thread.start()
+
+    # ==================================================================
+    # Library actions that need the window (trash, lyrics, Library menu)
+    # ==================================================================
+
+    def _trash_files(self, paths: list[str]) -> None:
+        """Move songs (and their lyrics) to the trash, after asking once."""
+        paths = [p for p in paths if os.path.exists(p)]
+        if not paths:
+            return
+        names = "\n".join(os.path.basename(p) for p in paths[:12])
+        if len(paths) > 12:
+            names += f"\n… and {len(paths) - 12} more"
+        title = "Move to Trash" if len(paths) == 1 else f"Move {len(paths)} Songs to Trash"
+        if QMessageBox.question(
+            self, title,
+            f"Move to the trash, with their lyrics?\n\n{names}\n\n"
+            "Devices that sync this folder will lose them too. You can restore them from the trash.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        if self.current_file_path in paths:
+            self._unload_song()
+        trashed, failed = [], []
+        for path in paths:
+            ok, _where = QFile.moveToTrash(path)
+            if not ok:
+                failed.append(os.path.basename(path))
+                continue
+            trashed.append(path)
+            lrc = os.path.splitext(path)[0] + ".lrc"
+            if os.path.exists(lrc):
+                QFile.moveToTrash(lrc)
+        self.library_panel.remove_paths(trashed)
+        msg = f"Moved {len(trashed)} song{'s' if len(trashed) != 1 else ''} to the trash."
+        if failed:
+            msg += f" Couldn't move {len(failed)}: {', '.join(failed[:5])}"
+        self.status_bar.setText(msg)
+
+    def _unload_song(self) -> None:
+        """Forget the loaded song (it's being trashed): stop, clear, empty page."""
+        self.player.stop()
+        self.player.set_media(None)
+        self.play_pause_btn.setText("▶")
+        self.song_is_loaded = False
+        self.current_file_path = ""
+        self.song_filename = ""
+        self.file_label.setText("Nothing playing")
+        self._replace_all_verses([])
+        self._dirty = False
+        self._update_title()
+        self._update_no_lyrics_card()
+        if self.workspace.currentIndex() == WORKSPACE_EDITOR:
+            self.workspace.setCurrentIndex(WORKSPACE_EMPTY)
+
+    def _find_lyrics_command(self) -> None:
+        """Ctrl+L: the library's selection when the list has focus (one song:
+        the picker; several: fetch automatically), else the open song."""
+        if self.library_panel.file_list.hasFocus():
+            paths = self.library_panel.selected_paths()
+            if len(paths) == 1:
+                self._open_lyrics_picker_for(paths[0])
+                return
+            if paths:
+                self._fetch_lyrics_for([p for p in paths if self.library_panel.status_of(p) != "synced"])
+                return
+        self._get_lyrics_online()
+
+    def _open_lyrics_picker_for(self, path: str) -> None:
+        if path != self.current_file_path:
+            if not self._confirm_discard_if_dirty():
+                return
+            self._load_song(path)
+        self._get_lyrics_online()
+
+    def _fill_library_menu(self) -> None:
+        menu = self.library_menu
+        menu.clear()
+        paths = self.library_panel.selected_paths()
+        if paths:
+            self.library_panel.fill_menu(menu, paths)
+        else:
+            hint = menu.addAction("Select songs in the library first")
+            hint.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Select All Shown Songs", self._select_all_library)
+
+    def _select_all_library(self) -> None:
+        self.library_panel.select_all_visible()
+        self.library_panel.file_list.setFocus()
+
+    def _update_no_lyrics_card(self) -> None:
+        empty = self.song_is_loaded and not any(v.get_verse_text().strip() for v in self._verses)
+        self.no_lyrics_card.setVisible(empty)
 
     def _on_file_converted(self, old_path: str, new_path: str) -> None:
         was_current = old_path == self.current_file_path
@@ -1508,6 +1589,8 @@ class LrcSyncApp(QMainWindow):
     # ==================================================================
 
     def _mark_dirty(self) -> None:
+        if not self.no_lyrics_card.isHidden():
+            self._update_no_lyrics_card()
         if not self._dirty:
             self._dirty = True
             self._update_title()
@@ -1662,6 +1745,7 @@ class LrcSyncApp(QMainWindow):
         # Freshly loaded content matches disk — not dirty until the user edits it.
         self._dirty = False
         self._update_title()
+        self._update_no_lyrics_card()
         self.status_bar.setText(f"Loaded: {self.song_filename}")
 
     def _play(self) -> None:

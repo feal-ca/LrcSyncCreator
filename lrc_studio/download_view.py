@@ -100,6 +100,7 @@ class DownloadView(QWidget):
     """
 
     files_ready     = pyqtSignal(list)   # list[str]
+    back_requested  = pyqtSignal()       # "← Search" in the header
     open_in_library = pyqtSignal(str)
     file_downloaded = pyqtSignal(str)    # emitted per completed row, for live library updates
 
@@ -165,6 +166,11 @@ class DownloadView(QWidget):
         layout.setSpacing(10)
 
         link_row = QHBoxLayout()
+        self.back_button = QPushButton("← Search")
+        self.back_button.setProperty("variant", "ghost")
+        self.back_button.setToolTip("Back to the Soulseek search (this import keeps going)")
+        self.back_button.clicked.connect(self.back_requested.emit)
+        link_row.addWidget(self.back_button)
         self.link_input = QLineEdit()
         self.link_input.setProperty("variant", "search")
         self.link_input.setPlaceholderText("Paste a Spotify track, album or playlist link")
@@ -177,7 +183,7 @@ class DownloadView(QWidget):
         layout.addLayout(link_row)
 
         self.status_label = QLabel(
-            "Paste a Spotify track, album, or playlist link and click Fetch. "
+            "Paste a Spotify track, album, or playlist link and press Enter. "
             "Every track not already in your library gets auto-matched on "
             "Soulseek for you to review before anything downloads."
         )

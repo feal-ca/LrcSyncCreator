@@ -85,8 +85,10 @@ def test_tab_bar_follows_programmatic_page_changes(window):
     window._show_page(app_module.WORKSPACE_TRANSFERS)
     assert window.tabs.currentIndex() == app_module.TAB_DOWNLOADS
 
-    window.tabs.setCurrentIndex(app_module.TAB_PLAYLIST)
-    assert window.workspace.currentIndex() == WORKSPACE_ACQUIRE
+    # The Spotify review has no tab of its own: it lives under Search.
+    window._show_page(WORKSPACE_ACQUIRE)
+    assert window.tabs.currentIndex() == app_module.TAB_SEARCH
+    assert window.tabs.count() == 3
 
 
 def test_editor_tab_shows_empty_state_until_a_song_is_loaded(window):
@@ -196,36 +198,131 @@ def test_download_view_instance_survives_workspace_swaps(window, tmp_path):
     view_before._search_thread = None
 
 
-def test_empty_state_add_music_button_shares_the_sidebars_menu(window):
-    # Review finding I3: the empty state's button used to connect
-    # directly to find_music_requested, so a zero-state user with local
-    # files (the common case) had no way to reach "Add Files" from it —
-    # only the sidebar's own button offered both options. Sharing the
-    # exact same QMenu object (not a second, hand-built equivalent)
-    # guarantees the two can never drift apart again.
-    assert window._empty_state_add_music_button.menu() is window.library_panel.add_music_button.menu()
+def test_empty_state_explains_what_to_do(window):
+    from PyQt6.QtWidgets import QLabel, QPushButton
+
+    page = window.workspace.widget(WORKSPACE_EMPTY)
+    texts = [label.text() for label in page.findChildren(QLabel)]
+    assert "Open a song to edit its lyrics" in texts
+    assert page.findChildren(QPushButton) == []
 
 
-def test_empty_state_add_music_menu_find_music_action_emits_signal(window, monkeypatch):
-    from PyQt6.QtWidgets import QDialog
-
-    # find_music_requested is also connected to the real _find_music,
-    # which opens a real modal SoulseekSearchDialog.exec() — blocking
-    # unless neutralized, same as test_app_commands.py's Find Music test.
-    monkeypatch.setattr(QDialog, "exec", lambda self: QDialog.DialogCode.Rejected)
-
-    received = []
-    window.library_panel.find_music_requested.connect(lambda: received.append(True))
-
-    window._empty_state_add_music_button.menu().actions()[1].trigger()
-
-    assert received == [True]
+def test_spotify_review_has_a_way_back_to_search(window):
+    window._show_page(WORKSPACE_ACQUIRE)
+    window.download_view.back_button.click()
+    assert window.workspace.currentIndex() == app_module.WORKSPACE_SEARCH
 
 
-def test_empty_state_add_music_menu_add_files_action_is_reachable(window):
-    # Not "not find_music_requested" — actually the same action the
-    # sidebar's "Add Files" runs, proving parity rather than assuming it.
-    assert window._empty_state_add_music_button.menu().actions()[0].text() == "Add Files"
+def test_library_menu_offers_the_selection_actions(window, tmp_path):
+    a, b = tmp_path / "a.mp3", tmp_path / "b.mp3"
+    a.write_bytes(b"")
+    b.write_bytes(b"")
+    window.library_panel.add_files([str(a), str(b)])
+    window.library_panel.select_all_visible()
+
+    window._fill_library_menu()
+
+    labels = [act.text() for act in window.library_menu.actions() if not act.isSeparator()]
+    assert "Move 2 to Trash…" in labels
+    assert labels[-1] == "Select All Shown Songs"
+
+
+def test_library_menu_without_selection_says_so(window):
+    window._fill_library_menu()
+    first = window.library_menu.actions()[0]
+    assert first.text() == "Select songs in the library first"
+    assert not first.isEnabled()
+
+
+def test_trash_unloads_the_open_song_and_removes_rows(window, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QFile
+    from PyQt6.QtWidgets import QMessageBox
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    (tmp_path / "song.lrc").write_text("[00:01.00]x\n", encoding="utf-8")
+    window.library_panel.add_files([str(song)])
+    window.library_panel.song_selected.emit(str(song))
+    trashed = []
+    monkeypatch.setattr(QFile, "moveToTrash", lambda p: (trashed.append(p) or True, p))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+
+    window._trash_files([str(song)])
+
+    assert trashed == [str(song), str(tmp_path / "song.lrc")]
+    assert window.library_panel.real_file_paths() == []
+    assert not window.song_is_loaded
+    assert window.workspace.currentIndex() == WORKSPACE_EMPTY
+
+
+def test_trash_cancelled_keeps_everything(window, tmp_path, monkeypatch):
+    from PyQt6.QtCore import QFile
+    from PyQt6.QtWidgets import QMessageBox
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    window.library_panel.add_files([str(song)])
+    monkeypatch.setattr(QFile, "moveToTrash", lambda p: pytest.fail("must not trash"))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Cancel)
+
+    window._trash_files([str(song)])
+
+    assert window.library_panel.real_file_paths() == [str(song)]
+
+
+def test_no_lyrics_card_shows_for_a_song_without_lyrics_and_hides_once_typed(window, tmp_path):
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    window.library_panel.add_files([str(song)])
+    window.library_panel.song_selected.emit(str(song))
+    assert not window.no_lyrics_card.isHidden()
+
+    window._verses[0].verse_text.setText("first line")
+
+    assert window.no_lyrics_card.isHidden()
+
+
+def test_no_lyrics_card_hidden_when_the_song_has_lyrics(window, tmp_path):
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    (tmp_path / "song.lrc").write_text("[00:01.00]hello\n", encoding="utf-8")
+    window.library_panel.add_files([str(song)])
+    window.library_panel.song_selected.emit(str(song))
+
+    assert window.no_lyrics_card.isHidden()
+
+
+def test_ctrl_l_with_several_library_songs_fetches_the_unsynced_ones(window, tmp_path, monkeypatch):
+    synced, missing = tmp_path / "a.mp3", tmp_path / "b.mp3"
+    synced.write_bytes(b"")
+    missing.write_bytes(b"")
+    (tmp_path / "a.lrc").write_text("[00:01.00]x\n", encoding="utf-8")
+    window.library_panel.add_files([str(synced), str(missing)])
+    window.library_panel.select_all_visible()
+    monkeypatch.setattr(window.library_panel.file_list, "hasFocus", lambda: True)
+    fetched = []
+    monkeypatch.setattr(window, "_fetch_lyrics_for", fetched.append)
+
+    window._find_lyrics_command()
+
+    assert fetched == [[str(missing)]]
+
+
+def test_save_embeds_only_when_the_setting_is_on(window, tmp_path, monkeypatch):
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    window.library_panel.add_files([str(song)])
+    window.library_panel.song_selected.emit(str(song))
+    window._verses[0].verse_text.setText("hello")
+    embedded = []
+    monkeypatch.setattr(app_module, "write_embedded_lyrics", lambda *a: embedded.append(a))
+
+    window.settings.setValue("embed_lyrics", False)
+    window._save_lrc_file()
+    window.settings.setValue("embed_lyrics", True)
+    window._save_lrc_file()
+
+    assert len(embedded) == 1
 
 
 def test_file_downloaded_adds_to_library_panel_live(window, tmp_path):

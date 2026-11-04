@@ -8,6 +8,7 @@ from __future__ import annotations
 
 
 from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -18,6 +19,7 @@ from PyQt6.QtWidgets import (
 import theme
 from constants import COLOR_DANGER, COLOR_SYNCED, COLOR_UNSYNCED
 from postprocess import DEFAULT_SLSKD_DOWNLOADS, _as_bool
+from utils import read_artist_title, write_artist_title
 from soulseek import SlskdClient, SoulseekFile
 
 
@@ -25,6 +27,100 @@ def _section(text: str) -> QLabel:
     label = QLabel(text)
     label.setProperty("role", "heading")
     return label
+
+
+class RenamePreviewDialog(QDialog):
+    """Shows what "Rename to “Artist - Title”" will do to several songs
+    before anything is touched: old name, new name (or why it stays)."""
+
+    def __init__(self, plans: list, parent=None) -> None:
+        super().__init__(parent)
+        import os
+
+        todo = [p for p in plans if p.new]
+        self.setWindowTitle("Rename to “Artist - Title”")
+        self.setMinimumSize(720, 420)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            f"{len(todo)} of {len(plans)} songs get a new name from their tags. "
+            "Their .lrc files are renamed with them."
+            if todo else "None of these songs can be renamed."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget(len(plans), 2)
+        self.table.setHorizontalHeaderLabels(["Now", "After"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setShowGrid(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        # Changes first, then the files that stay as they are.
+        ordered = todo + [p for p in plans if not p.new]
+        for row, plan in enumerate(ordered):
+            self.table.setItem(row, 0, QTableWidgetItem(os.path.basename(plan.old)))
+            after = QTableWidgetItem(os.path.basename(plan.new) if plan.new else plan.reason)
+            if not plan.new:
+                after.setForeground(QColor(theme.TEXT_3))
+            self.table.setItem(row, 1, after)
+        layout.addWidget(self.table, stretch=1)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        ok = self.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok.setText(f"Rename {len(todo)}")
+        ok.setProperty("variant", "primary")
+        ok.setEnabled(bool(todo))
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+
+class TagEditDialog(QDialog):
+    """Edit Artist & Title: the two tags that drive renaming and the
+    lyrics lookup."""
+
+    def __init__(self, path: str, parent=None) -> None:
+        super().__init__(parent)
+        import os
+
+        self._path = path
+        self.setWindowTitle("Edit Artist & Title")
+        self.setMinimumWidth(460)
+        layout = QVBoxLayout(self)
+        name = QLabel(os.path.basename(path))
+        name.setProperty("role", "muted")
+        layout.addWidget(name)
+        artist, title = read_artist_title(path)
+        form = QFormLayout()
+        self.artist_input = QLineEdit(artist)
+        self.title_input = QLineEdit(title)
+        form.addRow("Artist:", self.artist_input)
+        form.addRow("Title:", self.title_input)
+        layout.addLayout(form)
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet(f"color: {theme.DANGER};")
+        layout.addWidget(self.error_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Save).setProperty("variant", "primary")
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _save(self) -> None:
+        try:
+            write_artist_title(self._path, self.artist_input.text(), self.title_input.text())
+        except Exception as exc:  # noqa: BLE001 — shown to the user, dialog stays open
+            self.error_label.setText(f"Couldn't save the tags: {exc}")
+            return
+        self.accept()
 
 
 class SettingsDialog(QDialog):

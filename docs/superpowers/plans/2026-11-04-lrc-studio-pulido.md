@@ -90,6 +90,31 @@ Detailed from the lyrics-provider research report. Outline: providers module, Ne
 
 User ruling (2026-11-04): auto-fetch must NOT become stricter than today; the goal is MORE songs with lyrics. Extra providers raise coverage, cross-checking chooses among candidates, and only clearly broken results are dropped (credit-line junk, decoys, timing past the end of the song, a different song entirely). Plain lyrics are still saved when nothing synced exists, as today.
 
+## Phase B detail (from the aioslsk research; facade sketch kept in the plan workspace `aioslsk/slsk_client.py`)
+
+- Dependency: `aioslsk==1.7.1` pinned (the facade subclasses internals). Settings subclass blocks env-var injection; `reconnect.auto=False` (own backoff loop: 10 s→300 s, 60 s after EOF, none after kick/bad password); login wrapped in `asyncio.timeout(30)`; `store_results=False`; `aioslsk` logger at ERROR; `_DirectoryCommand` fixes the 1.7.1 browse-ticket bug; event listeners are bound methods (EventBus holds weak refs).
+- Transfer state → slskd strings: queued (not remote) "Queued, Locally"; remote "Queued, Remotely"; INITIALIZING "Initializing"; DOWNLOADING "InProgress"; COMPLETE "Completed, Succeeded"; FAILED local "Completed, Errored"; FAILED other "Completed, Rejected" + exception; ABORTED "Completed, Cancelled". `get_download_transfer` adds `localPath`; `wait_for_download` prefers it.
+- Downloads dir outside `~/Music` (app data dir); share `library_dir` to everyone, 2 upload slots, upload capped; listen port 2234 + UPnP.
+- Credentials: settings `soulseek_username` / `soulseek_password`; migrated once from `slskd-bin/slskd.yml` when empty.
+- Client is started on a background thread, never on the GUI thread; `close()` in `closeEvent`.
+
 ## Phase D: verified bugs and speed findings from the code critique
+
+Each fix gets a failing test first.
+- D1 Non-UTF-8 `.lrc` aborts startup (`utils.py:134-143`): shared `read_lrc_text()` (utf-8-sig, BOM'd utf-16, cp1252); status never raises; `sys.excepthook` logs instead of aborting.
+- D2 Save destroys what the parser dropped: keep unknown lines and metadata, accept `[mm:ss]` and 3-digit minutes, strip BOM, atomic write (tmp + `os.replace`), refuse to save over a file that failed to load.
+- D3 Batch fetch overwrites lyrics saved after it started (`workers.py:97-99`): re-check right before writing; never replace synced lyrics.
+- D4 Timeline `IndexError` after deleting a selected line: clear selection in `load_data`.
+- D5 Lyrics matching false positives (token_set_ratio containment, missing artist = 100, NetEase credit lines) — folded into Phase C.
+- D6 Saving the blank starter row marks a song "synced": don't write an all-empty file; status counts real (non-zero) stamps.
+- D7 `[offset:]` applied with the wrong sign: subtract.
+- D8 Closing during conversion leaves a temp file and a running ffmpeg: ask, kill ffmpeg, delete the temp.
+- D9 Undo after Shift timing restores one line per Ctrl+Z: one undo entry per operation.
+- D10 Timeline blank until Play: set duration from the file's tags at load.
+- D11 Clear all / deleting the last line leaves no row: always keep one blank row.
+- D12 Dialogs never freed: `deleteLater()` after `exec()`.
+- S1 Sync key and Up/Down cost ~100 ms: restyle only the old and new active rows (dynamic property in the global stylesheet).
+- S2 Song load ~385 ms: reuse row widgets across loads.
+- S3 Poll timer repaints while paused: skip work when not playing.
 
 ## Phase E: README, full suite, screenshots, whole-branch review subagent

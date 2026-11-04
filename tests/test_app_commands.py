@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import QApplication, QInputDialog, QMessageBox
 import app as app_module
 from app import LrcSyncApp
 
-_MENU_NAMES = {"file", "edit", "tools", "help"}
+_MENU_NAMES = {"file", "lyrics", "help"}
 
 
 @pytest.fixture(scope="module")
@@ -223,11 +223,11 @@ def test_find_music_routes_plain_text_to_soulseek_search(window, monkeypatch):
     assert window.search_view._history()[0] == "Bohemian Rhapsody Queen"
 
 
-def test_command_table_has_one_find_music_entry_not_two(window):
-    labels = [cmd.label for cmd in window._commands]
-    assert "Find Music…" in labels
-    assert "Find on Soulseek…" not in labels
-    assert "Import from Spotify" not in labels
+def test_command_table_has_one_soulseek_search_entry(window):
+    by_label = {cmd.label: cmd for cmd in window._commands}
+    assert by_label["Search Soulseek"].shortcut == "Ctrl+F"
+    assert "Find Music…" not in by_label
+    assert "Add Files…" not in by_label
 
 
 # ---------------------------------------------------------------------------
