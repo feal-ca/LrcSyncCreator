@@ -106,3 +106,33 @@ def test_lyrics_picker_lists_every_source_in_one_table(qapp):
     assert headers == ["Title", "Artist", "Source", "Length", "Timing"]
     assert [dialog.table.item(r, 2).text() for r in range(2)] == ["LRCLIB", "QQ Music"]
     assert dialog.table.item(1, 0).text() == "Clandestino (Live)"
+
+
+def test_settings_fields_are_not_squashed(qapp, tmp_path):
+    from PyQt6.QtCore import QSettings
+
+    settings = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
+    dialog = dialogs.SettingsDialog(settings, soulseek_status="Connected to Soulseek.")
+    dialog.show()
+    qapp.processEvents()
+
+    for field in (dialog.soulseek_username, dialog.soulseek_password, dialog.library_dir):
+        assert field.height() >= field.minimumSizeHint().height()
+    dialog.close()
+
+
+def test_an_error_in_the_tag_dialog_does_not_squash_the_fields(qapp, monkeypatch):
+    def boom(*_a):
+        raise ValueError("a fairly long error message that will need to wrap onto a second line")
+
+    monkeypatch.setattr(dialogs, "read_artist_title", lambda path: ("A", "B"))
+    monkeypatch.setattr(dialogs, "write_artist_title", boom)
+    dialog = dialogs.TagEditDialog("/m/song.mp3")
+    dialog.show()
+    qapp.processEvents()
+
+    dialog._save()
+    qapp.processEvents()
+
+    assert dialog.artist_input.height() >= dialog.artist_input.minimumSizeHint().height()
+    dialog.close()

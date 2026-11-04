@@ -119,6 +119,7 @@ class TagEditDialog(QDialog):
             write_artist_title(self._path, self.artist_input.text(), self.title_input.text())
         except Exception as exc:  # noqa: BLE001 — shown to the user, dialog stays open
             self.error_label.setText(f"Couldn't save the tags: {exc}")
+            self.adjustSize()      # make room for the message instead of squashing the fields
             return
         self.accept()
 
@@ -151,7 +152,7 @@ class SettingsDialog(QDialog):
 
         layout.addSpacing(6)
         layout.addWidget(_section("Downloads"))
-        self.convert_check = QCheckBox("Convert lossless downloads (FLAC, WAV, ALAC) to Opus")
+        self.convert_check = QCheckBox("Convert lossless downloads (FLAC, WAV, AIFF, ALAC…) to Opus")
         self.convert_check.setChecked(_as_bool(settings.value("convert_lossless", True), True))
         self.bitrate_combo = QComboBox()
         for kbps in (128, 160, 192, 256):
@@ -218,6 +219,9 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addSpacing(6)
         layout.addWidget(buttons)
+        # A window's minimum height ignores word-wrapped labels, which then
+        # squashed the account fields to a sliver; the size hint counts them.
+        self.setMinimumSize(self.sizeHint())
 
     def _browse_library(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Choose Music Folder", self.library_dir.text())
