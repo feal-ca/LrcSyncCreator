@@ -1,143 +1,72 @@
 # LRC Studio
 
-LRC Studio is a desktop app for keeping a music library with synced
-lyrics. It searches and downloads from Soulseek (through slskd), imports
-Spotify tracks, albums and playlists, finds lyrics online, and has an
-editor for syncing them by hand when nothing online fits.
+LRC Studio is a desktop app for keeping a music library with synced lyrics. It finds and downloads music from Soulseek, imports Spotify tracks, albums and playlists, finds lyrics online, and has an editor for syncing them by hand when nothing online fits.
 
 ![Demo](ExampleUseVideo.gif)
 
 ## What it does
 
-- Your library folder loads on startup. Every song shows a dot: filled
-  green for synced lyrics, filled sand for lyrics without timing, hollow
-  for none. A search box and a status filter narrow the list, and the line
-  under it counts what is left to do.
-- The Search page works like Nicotine+. Search a title, then type the
-  artist into the filter box (or the other way round). The filter matches
-  the whole remote path and the uploader, ignores accents, and `-word`
-  excludes. You can also filter by format, minimum bitrate and free upload
-  slot, sort by any column, download several files at once, or grab a
-  peer's whole folder (an album).
-- The Downloads page lists every download, from Search and from playlist
-  imports alike, and says what each one is doing: waiting for the peer to
-  answer, its place in the peer's queue, or percent, speed and time left.
-  Up to six run at once. A peer that rejects the request or never answers
-  is dropped for another peer's copy of the same file when one exists, and
-  "Try another source now" (right-click) does it on demand. You can cancel
-  and retry, and the app asks before quitting with downloads running.
-- Finished downloads are converted, renamed and filed. Lossless files
-  (FLAC, WAV, ALAC) become Opus at 192 kbps with tags and cover art kept,
-  and the original is deleted once the Opus file checks out. Lossy files
-  are never re-encoded. Each file is renamed to "Artist - Title" from its
-  tags and moved into the library, and lyrics are fetched for it. All of
-  this can be switched off in Settings.
-- Lyrics come from LRCLIB first, matched on artist, title, album and the
-  track's real duration, so a live cut or an extended mix is not taken
-  for the album version. Then other providers (Musixmatch, NetEase,
-  Megalobiz) are tried, and their results are rejected if their timing
-  runs past the end of the song. Plain text without timing is the last
-  resort, and the dot shows it. Queries come from the file's tags, with
-  track numbers, "(feat. …)" and "- Remastered" stripped.
-- Get lyrics (Ctrl+L) lists the candidates with their length next to
-  your file's, so a version that is 40 seconds longer stands out. Preview
-  one and pick it.
-- Pasting a Spotify link into the search box opens the Playlist page.
-  Every track you don't already have is matched on Soulseek for review
-  before anything downloads. Change match opens the same filterable
-  results, with the artist already typed into the filter.
-- In the editor, press S to stamp the current line, drag markers on the
-  timeline, shift every timestamp at once, and save to a `.lrc` file next
-  to the song. Saving can also embed the lyrics in the file's tags
-  (MP3, FLAC, Opus, OGG, M4A).
-- Tools → Convert Lossless Files to Opus converts the FLAC/WAV/ALAC
-  files already in your library, in place, after asking. The `.lrc`
-  files keep working because the file name only changes its extension.
-- Validate Sync (optional) spot-checks a few lines against the audio
-  with faster-whisper.
+- Your library folder loads on startup, newest songs first. Songs that arrived since you last looked are tagged "new" until you open them. Every song shows a dot: filled green for synced lyrics, filled sand for lyrics without timing, hollow for none. One filter with live counts shows only new songs, songs without lyrics or songs not synced yet, and the search box narrows the list by name.
+- Everything you can do to songs is on the right-click menu, for one song or a selection (Shift- or Ctrl-click, Ctrl+A for everything shown): open in the editor, find lyrics, rename to "Artist - Title" from the tags (with a preview of every change), edit artist and title, convert lossless files to Opus, show in the folder, or move to the trash (Del). The Library menu has the same actions for the current selection.
+- LRC Studio talks to Soulseek itself, like Nicotine+, so there is no separate program to install. Type the artist and title on the Search page (Ctrl+F) and results appear as people answer. Copies of the same file are grouped into one row per version, and the version you most likely want is on top and already selected. Versions with every word you typed in the file name come first; karaoke, remix, live and sped-up versions you didn't ask for go further down; after that, the most shared, the best quality and the soonest available win. Enter downloads the best copy, Shift+Enter the whole album. If a copy fails, the other copies of the same version are tried automatically. Each row shows its own download and says "In library" for songs you already have.
+- The Downloads page (Ctrl+J) lists every download and what it's doing: starting, queued by the uploader (with its place in the queue), or percent, speed and time left. Up to six run at once. Right-click to try another copy, retry or cancel.
+- Finished downloads are converted, renamed and filed. Lossless files (FLAC, WAV, AIFF, ALAC, APE, WavPack) become Opus, 192 kbps by default, with tags and cover art kept, and the original is deleted once the Opus file checks out. Lossy files are never re-encoded. Each file is renamed to "Artist - Title" from its tags, moved into the library, and its lyrics are looked up. Each of these steps can be switched off in Settings.
+- Lyrics come from LRCLIB first, matched on artist, title, album and the track's real duration. A hit is checked against Megalobiz. When the two disagree, QQ Music and NetEase are asked too and the version most sources agree on wins, since LRCLIB entries are sometimes several seconds off. When LRCLIB has nothing, those sources fill in, and YouTube Music can be turned on in Settings for more Spanish and Catalan songs. Credit lines are stripped, and lyrics whose timing runs past the end of the song are rejected. Plain text without timing is the last resort, and the dot shows it. Lyrics you have synced are never overwritten automatically.
+- Find lyrics (Ctrl+L) shows every source's results in one list, each with its length next to your file's, so a version that is 40 seconds longer stands out. Preview one and pick it. With several songs selected in the library, Ctrl+L looks them all up automatically.
+- Pasting a Spotify link into the search box opens its review. Every track you don't already have is matched on Soulseek before anything downloads, and "Pick another copy…" shows the other results.
+- In the editor, press S to stamp the current line, drag markers on the timeline, shift every timestamp at once (Ctrl+Shift+O), and save to a `.lrc` file next to the song (Ctrl+S). Ctrl+Z undoes the last timing change, including a whole shift. Saving keeps the file's tags such as `[ar:]` and `[ti:]`, and can also embed the lyrics in the audio file's tags (MP3, FLAC, Opus, OGG, M4A).
+- Check Sync (optional) spot-checks a few lines against the audio with faster-whisper.
 
 ## Installation
 Clone this repository, then install the dependencies:
 ```bash
 pip install -r requirements.txt
 ```
-You'll also need VLC installed at the system level, `ffmpeg` for converting downloads to Opus, and `pactl` on Linux for the audio-device selector.
+You'll also need VLC installed at the system level, `ffmpeg` for converting to Opus, and `pactl` on Linux for the audio-device selector.
 
-Optional, for Validate Sync:
+Optional, for Check Sync and for YouTube Music lyrics:
 ```bash
 pip install -r requirements-optional.txt
 ```
-Also needs `ffmpeg` on your system `PATH` (used to extract the short audio clips it transcribes). Install it via your package manager (e.g. `apt install ffmpeg`, `dnf install ffmpeg`). Without it, every sampled line comes back unable to check.
+Check Sync also needs `ffmpeg` on your system `PATH` (used to extract the short audio clips it transcribes). Install it via your package manager (e.g. `apt install ffmpeg`, `dnf install ffmpeg`). Without it, every sampled line comes back unable to check.
 
-Runs locally on CPU; the app measured ~1.5s to load its model plus ~2.5s per sampled line on a 16-thread i7 laptop (first run also downloads a ~150MB model, needs internet once). It only samples a handful of short clips per song, not the whole track, specifically to stay light. See the "Validate Sync" section below for what it can and can't catch.
-
-Optional, for Soulseek and Spotify import:
-```bash
-./scripts/setup_slskd.sh   # downloads slskd, writes a starter config
-```
-Then edit `slskd-bin/slskd.yml`: replace the `soulseek.username`/`password` placeholders with a real Soulseek account (Soulseek auto-registers a new username the first time you log in with it, so pick something real). You'll likely also want to add a `shares.directories` entry pointing at some real folder of yours: in testing, plenty of peers simply don't respond to searches from accounts sharing zero files.
-
-In LRC Studio, go to Tools → Settings and fill in slskd's URL (`http://127.0.0.1:5030` by default) and the API key `setup_slskd.sh` printed. That's the last manual step. The first time a Soulseek feature needs slskd and it isn't already running, LRC Studio launches it itself (via `./scripts/run_slskd.sh`) and waits for it to come up; you can still run that script by hand if you'd rather watch its logs directly.
+Check Sync runs locally on CPU; the app measured ~1.5s to load its model plus ~2.5s per sampled line on a 16-thread i7 laptop (the first run also downloads a ~150MB model, so it needs internet once). It only samples a handful of short clips per song, not the whole track, to stay light. See the "Check Sync" section below for what it can and can't catch.
 
 ## Usage
 
 Run `./run-lrc.sh`, or `python3 lrc_studio/main.py`.
 
-Set your music folder and slskd's details once in Tools → Settings
-(Ctrl+,). The library fills itself from that folder on every start;
-drop files or folders on the window to add others. When LRC Studio starts
-slskd itself, slskd's output goes to `slskd-bin/slskd-app.log`.
+Open File → Settings (Ctrl+,) once and set:
+
+- Your music folder. The library fills itself from it on every start; drop files or folders on the window to add others.
+- A Soulseek username and password. Soulseek registers a new name the first time you log in with it. If you used the old slskd setup, its account is picked up automatically. Don't use the same account in Nicotine+ at the same time: Soulseek logs the other session out.
+- Whether to share your music folder. Many people only send files to users who share something, so sharing is on by default, with uploads limited to two at a time.
+
+LRC Studio logs in to Soulseek in the background when it starts, and the connection state shows next to the tabs. It listens on port 2234 and asks your router to forward it (UPnP). Without a forwarded port, downloads from people who are also behind a firewall can fail. Downloads stay in `~/.local/share/LrcStudio/downloads` until they finish, then move into your music folder.
 
 ### Finding music
 
-Ctrl+F opens the Search page. Results arrive once peers have answered,
-which takes up to 25 seconds; the counter shows how many have answered so
-far, and "Show results now" stops waiting. Double-click a result or press
-Enter to download it. Right-click for the whole folder, or to show only
-one uploader's files.
+Ctrl+F opens the Search page. Type the artist and the title and press Enter; results keep arriving for up to a minute. The filter box narrows them (`-word` hides) and "Lossless only" hides everything else. Click the arrow on a row to see who has that version, and pick a particular copy if you prefer it.
 
-Quality is shown per file. Anything below 192 kbps (128 kbps for Opus and
-OGG) is greyed out.
+Quality is shown per version. Anything below 192 kbps (128 kbps for Opus and OGG) is greyed out.
 
 ### Importing from Spotify
 
-Paste a track, album or playlist link into the search box or the
-Playlist page. Tracks already in your library are marked straight away.
-Spotify's public embed page only lists the first 50 tracks of an album or
-playlist, and longer ones are flagged as truncated. The rest are searched
-on Soulseek three at a time, artist and title first, then the title
-alone, then the artist alone, and each row shows how many peers have
-answered. The pick favours any file that is good enough (lossless, or
-lossy at 192 kbps or more, 128 for Opus/Vorbis) and then whichever will
-arrive soonest.
+Paste a track, album or playlist link into the search box. Tracks already in your library are marked straight away. Spotify's public embed page only lists the first 50 tracks of an album or playlist, and longer ones are flagged as truncated. The rest are searched on Soulseek three at a time: artist and title first, then the title alone, then the artist alone. Each row shows how many peers have answered. The pick favours any file that is good enough (lossless, or lossy at 192 kbps or more, 128 for Opus/Vorbis) and then whichever will arrive soonest.
 
-Nothing downloads until you click Download All Missing or a row's
-Download. Download All Missing works as soon as one track is matched, and
-tracks still being searched then download as soon as they're matched.
-Each row shows its download live. If a source rejects the request, never
-answers, stops sending, or keeps the track in its queue for three
-minutes, the row moves on to its next candidate, up to three per track;
-"Other source" does that right away.
+Nothing downloads until you click "Download all missing" or a row's "Download". "Download all missing" works as soon as one track is matched, and tracks still being searched then download as soon as they're matched. Each row shows its download live. If a source rejects the request, never answers, stops sending, or keeps the track in its queue for three minutes, the row moves on to its next candidate, up to three per track; "Try another copy" does that right away.
 
 ### Syncing lyrics
 
-1. Double-click a song in the library. If it has no lyrics, use
-   Get lyrics, or type them in (Enter moves to the next line).
-2. Play it and press S as each line starts, or drag the markers on the
-   timeline.
+1. Double-click a song in the library, or select it and press Enter. If it has no lyrics, click Find lyrics, or type them in (Enter moves to the next line).
+2. Play it and press S as each line starts, or drag the markers on the timeline.
 3. Save with Ctrl+S.
 
 Help → Keyboard Shortcuts lists every shortcut.
 
-### Validate Sync
+### Check Sync
 
-Tools → Validate Sync samples up to 5 lines spread across the song,
-extracts a short clip around each one's timestamp and transcribes it
-locally with faster-whisper. Each line is checked for text (a fuzzy match
-that tolerates misheard words) and for timing (does speech start near the
-timestamp?). It is a spot-check and won't catch problems in lines it
-doesn't sample. Whisper's word timestamps wobble by about a second on a
-clip's first word, so the timing check only flags multi-second drift.
+Lyrics → Check Sync samples up to 5 lines spread across the song, extracts a short clip around each one's timestamp and transcribes it locally with faster-whisper. Each line is checked for text (a fuzzy match that tolerates misheard words) and for timing (does speech start near the timestamp?). It is a spot-check and won't catch problems in lines it doesn't sample. Whisper's word timestamps wobble by about a second on a clip's first word, so the timing check only flags multi-second drift.
 
 ## Development
 
@@ -146,8 +75,7 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-The tests run without a display (Qt's offscreen platform) and never touch
-your real settings or library. The format conversion tests need `ffmpeg`.
+The tests run without a display (Qt's offscreen platform), never touch your real settings or library, and never go online: Soulseek and the lyrics sources are replaced with fakes. The format conversion tests need `ffmpeg`.
 
 ## Roadmap
 
@@ -156,4 +84,4 @@ your real settings or library. The format conversion tests need `ffmpeg`.
 
 ## License
 
-MIT License.
+LRC Studio's own code is under the MIT License. It uses aioslsk for Soulseek, which is GPL-3.0-or-later; if you distribute LRC Studio together with it, the GPL's terms apply to the combined work.
