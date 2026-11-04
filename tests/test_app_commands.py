@@ -118,7 +118,7 @@ def test_clear_lyrics_clears_on_confirm(window, monkeypatch):
 
     window._clear_lyrics()
 
-    assert len(window._verses) == 0
+    assert [v.get_verse_text() for v in window._verses] == [""]   # one blank row to type into
 
 
 def test_clear_lyrics_skips_the_prompt_when_theres_nothing_to_clear(window, monkeypatch):
@@ -380,10 +380,9 @@ def test_replace_all_verses_clears_undo_stack_stale_entries(window):
 
     window._replace_all_verses([("[00:05.00]", "new line")])
 
-    assert old_verse not in window._verses
-    # The undo entry for the removed verse is harmless (already covered by
-    # _undo_last_sync's "skip stale entries" logic from the earlier fix),
-    # but confirm the new verse list is exactly the replacement.
+    # Line widgets are reused, so an old undo entry would now point at a
+    # different line: replacing the lyrics must drop the undo history.
+    assert window._undo_stack == []
     assert [v.get_verse_text() for v in window._verses] == ["new line"]
 
 

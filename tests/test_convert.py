@@ -177,3 +177,38 @@ def test_without_ffmpeg_nothing_happens(tmp_path, monkeypatch):
     with pytest.raises(ConversionError):
         convert_to_opus(str(src))
     assert src.exists()
+
+
+def test_a_conversion_can_be_cancelled_and_leaves_nothing_behind(tmp_path, monkeypatch):
+    src = tmp_path / "Song.flac"
+    src.write_bytes(b"original")
+    monkeypatch.setattr(convert, "ffmpeg_available", lambda: True)
+    killed = []
+
+    class _ForeverFfmpeg:
+        returncode = None
+
+        def __init__(self, cmd, **_kw):
+            with open(cmd[-1], "wb") as fh:      # ffmpeg has started writing the temp file
+                fh.write(b"partial")
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            killed.append(True)
+
+        def wait(self, timeout=None):
+            return -9
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+    monkeypatch.setattr(convert.subprocess, "Popen", _ForeverFfmpeg)
+
+    with pytest.raises(convert.ConversionError, match="Cancelled"):
+        convert.convert_to_opus(str(src), should_cancel=lambda: True)
+
+    assert killed
+    assert src.read_bytes() == b"original"
+    assert [p.name for p in tmp_path.iterdir()] == ["Song.flac"]

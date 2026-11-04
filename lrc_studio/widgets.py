@@ -77,6 +77,9 @@ class TimelineWidget(QWidget):
         """Reload from a verse list (any object with ``get_timestamp()``)."""
         self.duration_ms = max(1, duration_ms)
         self.timestamps  = [parse_lrc_timestamp(v.get_timestamp()) for v in verses]
+        # Lines may have been deleted: a selection pointing past the end
+        # would crash the next drag.
+        self.selected_indices = {i for i in self.selected_indices if i < len(self.timestamps)}
         self.update()
 
     def set_position(self, pos_ms: int) -> None:
@@ -397,6 +400,8 @@ class Verse(QWidget):
 
     def set_active(self, active: bool) -> None:
         """Mark this line as the keyboard-nav / sync target (colored border)."""
+        if getattr(self, "_is_active", None) == active:
+            return            # restyling is the slow part; skip no-ops
         self._is_active = active
         self.inner.setStyleSheet(self._compute_style())
 
@@ -406,6 +411,8 @@ class Verse(QWidget):
         Independent of ``set_active`` so live playback following never
         overrides the line the user has manually selected for sync/nav.
         """
+        if getattr(self, "_is_playing", None) == playing:
+            return
         self._is_playing = playing
         self.inner.setStyleSheet(self._compute_style())
 

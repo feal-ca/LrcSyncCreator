@@ -682,7 +682,7 @@ class LibraryConvertThread(QThread):
                 break
             self.progress.emit(f"Converting {os.path.basename(path)}", i, total)
             try:
-                new_path = convert.convert_to_opus(path, self._bitrate)
+                new_path = convert.convert_to_opus(path, self._bitrate, should_cancel=self._cancel_event.is_set)
             except Exception as exc:  # noqa: BLE001 — report and keep going
                 failed.append(f"{os.path.basename(path)}: {exc}")
                 continue

@@ -27,16 +27,16 @@ from constants import (
 # Pre-compiled regexes
 # ---------------------------------------------------------------------------
 
-# Matches a well-formed LRC timestamp: [mm:ss.xx] or [mm:ss.xxx]
-_LRC_TS_RE = re.compile(r"\[\d{2}:\d{2}\.\d{2,3}\]")
+# A timestamp: [mm:ss.xx], [mm:ss.xxx], [mm:ss] or [mmm:ss.xx] (past 100 min).
+_LRC_TS_RE = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
 
-# Matches LRC metadata tags that should be silently skipped.
+# Metadata tags: kept aside on load and written back on save.
 _LRC_META_RE = re.compile(
-    r"^\[(?:ar|al|ti|au|by|length|re|ve):", re.IGNORECASE
+    r"^\[(?:ar|al|ti|au|by|length|re|ve|tool|#):", re.IGNORECASE
 )
 
 # Captures the numeric components of a timestamp for efficient parsing.
-_LRC_LINE_RE = re.compile(r"\[(\d{1,2}):(\d{2})\.(\d{2,3})\]")
+_LRC_LINE_RE = _LRC_TS_RE
 
 # Captures the [offset:N] global timing correction tag.
 _LRC_OFFSET_RE = re.compile(r"^\[offset:(-?\d+)\]$", re.IGNORECASE)
@@ -75,7 +75,7 @@ def ms_to_lrc_timestamp(ms: int) -> str:
     m  = ms // 60_000
     s  = (ms % 60_000) // 1_000
     cs = (ms % 1_000) // 10          # centiseconds
-    return f"[{m:02d}:{s:02d}.{cs:02d}]"
+    return f"[{m:02d}:{s:02d}.{cs:02d}]"     # three-digit minutes past 99
 
 
 def parse_lrc_timestamp(ts: str) -> int:
@@ -87,8 +87,8 @@ def parse_lrc_timestamp(ts: str) -> int:
     """
     try:
         inner = ts.strip("[]")
-        time_part, _, frac = inner.partition(".")
-        m_str, _, s_str   = time_part.partition(":")
+        m_str, _, rest = inner.partition(":")
+        s_str, _, frac = rest.replace(":", ".").partition(".")
         m   = int(m_str)
         s   = int(s_str)
         # Normalise fractional part to milliseconds regardless of digit count.
@@ -107,41 +107,74 @@ def parse_lrc_timestamp(ts: str) -> int:
 # LRC file analysis
 # ---------------------------------------------------------------------------
 
+def read_lrc_text(path: str) -> str:
+    """The text of an .lrc file in whatever encoding it was saved: UTF-8
+    (with or without BOM), UTF-16 with a BOM, else Windows-1252/Latin-1.
+    Raises only OSError."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("cp1252")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
+
+
 def lrc_status_key(lrc_path: str) -> str:
-    """"synced" | "plain" | "missing" — the same verdict as
-    ``analyze_lrc_status``, as a plain string for icons and filters."""
-    color = analyze_lrc_status(lrc_path)
-    if color == COLOR_SYNCED:
-        return "synced"
-    if color == COLOR_UNSYNCED:
+    """"synced" | "plain" | "missing" for the .lrc at *lrc_path*.
+
+    * missing — no file, or no lyric text in it (an empty starter row
+      saved as "[00:00.00] " doesn't count as lyrics).
+    * plain   — lyrics without real timing (no stamps, or almost all at 0).
+    * synced  — lyrics with real timestamps.
+    Never raises.
+    """
+    try:
+        if not os.path.exists(lrc_path) or os.path.getsize(lrc_path) == 0:
+            return "missing"
+        content = read_lrc_text(lrc_path)
+    except (OSError, ValueError):
+        return "missing"
+    stamps = 0
+    real = 0
+    has_text = False
+    for raw in content.splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if not line or _LRC_META_RE.match(line) or _LRC_OFFSET_RE.match(line):
+            continue
+        found = _LRC_TS_RE.findall(line)
+        if _LRC_TS_RE.sub("", line).strip():
+            has_text = True
+        for m_str, s_str, frac in found:
+            stamps += 1
+            if int(m_str) or int(s_str) or int(frac or 0):
+                real += 1
+    if not has_text:
+        return "missing"
+    if real == 0 or real / max(stamps, 1) < 0.2:
         return "plain"
-    return "missing"
+    return "synced"
 
 
 def analyze_lrc_status(lrc_path: str) -> QColor:
-    """Return a status colour reflecting the quality of *lrc_path*.
+    """``lrc_status_key`` as a status colour (older callers)."""
+    return {"synced": COLOR_SYNCED, "plain": COLOR_UNSYNCED}.get(lrc_status_key(lrc_path), COLOR_MISSING)
 
-    * ``COLOR_MISSING``  — file does not exist or is empty.
-    * ``COLOR_UNSYNCED`` — file exists but timestamps look unedited
-                           (>80 % are ``[00:00…]``).
-    * ``COLOR_SYNCED``   — file has real, varied timestamps.
-    """
-    if not os.path.exists(lrc_path):
-        return COLOR_MISSING
-    try:
-        if os.path.getsize(lrc_path) == 0:
-            return COLOR_MISSING
-        with open(lrc_path, encoding="utf-8") as fh:
-            content = fh.read()
-        timestamps = _LRC_TS_RE.findall(content)
-        if not timestamps:
-            return COLOR_UNSYNCED
-        zero_count = sum(1 for t in timestamps if t.startswith("[00:00"))
-        if len(timestamps) > 5 and (zero_count / len(timestamps)) > 0.8:
-            return COLOR_UNSYNCED
-        return COLOR_SYNCED
-    except OSError:
-        return COLOR_MISSING
+
+def lrc_metadata_lines(text: str) -> list[str]:
+    """The [ar:]/[ti:]/[al:]… tag lines of an LRC, to write back on save.
+    [offset:] is left out: it's applied to the timestamps on load."""
+    out = []
+    for raw in text.splitlines():
+        line = raw.strip().lstrip("\ufeff")
+        if _LRC_META_RE.match(line):
+            out.append(line)
+    return out
 
 
 def parse_lrc_file(text: str) -> tuple[list[tuple[str, str]], int]:
@@ -162,7 +195,7 @@ def parse_lrc_file(text: str) -> tuple[list[tuple[str, str]], int]:
     global_offset_ms: int = 0
 
     for raw in text.splitlines():
-        line = raw.strip()
+        line = raw.strip().lstrip("\ufeff")
         if not line:
             continue
 
@@ -182,12 +215,13 @@ def parse_lrc_file(text: str) -> tuple[list[tuple[str, str]], int]:
             content = _LRC_LINE_RE.sub("", line).strip()
             for m_str, s_str, frac in ts_matches:
                 # Normalise to 2-digit centiseconds for storage.
-                cs = frac[:2]
+                cs = (frac or "00").ljust(2, "0")[:2]
                 ts_str = f"[{int(m_str):02d}:{int(s_str):02d}.{cs}]"
                 lines.append((ts_str, content))
 
-        elif not line.startswith("["):
-            # Plain lyric line with no timestamp — keep with default stamp.
+        else:
+            # A line with no timestamp (plain lyrics, or a label such as
+            # "[Chorus]") — kept as an unsynced line rather than dropped.
             lines.append((DEFAULT_TIMESTAMP, line))
 
     return lines, global_offset_ms

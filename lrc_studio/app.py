@@ -47,9 +47,11 @@ from constants import (
 )
 from utils import (
     format_ms,
+    lrc_metadata_lines,
     ms_to_lrc_timestamp,
     parse_lrc_file,
     parse_lrc_timestamp,
+    read_lrc_text,
     write_embedded_lyrics,
 )
 import lyrics_qa
@@ -89,6 +91,18 @@ class _Command:
     menu: str | None                  # "file" | "lyrics" | "help" | None (shortcut only)
     help_text: str | None = None      # Help-dialog phrasing; defaults to *label*
     separator_before: bool = False    # start a new group within its menu
+
+
+def audio_duration_ms(path: str) -> int | None:
+    """The song's length from its tags, so the timeline is right before
+    VLC has played anything. None when it can't be read."""
+    try:
+        import mutagen
+        audio = mutagen.File(path)
+        length = getattr(getattr(audio, "info", None), "length", None)
+        return int(length * 1000) if length and length > 0 else None
+    except Exception:
+        return None
 
 
 # An old slskd setup's config: its Soulseek account is carried over once.
@@ -136,8 +150,13 @@ class LrcSyncApp(QMainWindow):
         # Timestamp cache in ms — rebuilt via _rebuild_timestamp_cache()
         self._verse_timestamps:  list[int]   = []
 
-        # Undo stack: list of (verse_index, old_timestamp_str) snapshots
-        self._undo_stack: list[tuple[Verse, str]] = []
+        # Undo stack: one entry per operation (a sync, a shift, a timeline
+        # drag), each a list of (verse, old_timestamp) to restore together.
+        self._undo_stack: list[list[tuple[Verse, str]]] = []
+        # The loaded .lrc's metadata lines ([ar:], [ti:]…), written back on
+        # save, and whether reading it failed (then saving asks first).
+        self._lrc_meta: list[str] = []
+        self._lrc_load_failed = False
 
         # Seek-bar drag state (preserves play/pause across slider drags)
         self._was_playing_before_drag: bool = False
@@ -195,6 +214,15 @@ class LrcSyncApp(QMainWindow):
             return
 
         state = self.player.get_state()
+        if state in (vlc.State.Paused, vlc.State.Stopped):
+            # Nothing moves while paused: skip the repaint unless a seek
+            # changed the position.
+            pos = self.player.get_time()
+            if pos == getattr(self, "_last_polled_pos", None):
+                return
+            self._last_polled_pos = pos
+        else:
+            self._last_polled_pos = None
 
         if state == vlc.State.Ended:
             if not self._ended_handled:
@@ -933,23 +961,35 @@ class LrcSyncApp(QMainWindow):
             self._playback_highlight_verse = None
         self.lyrics_layout.removeWidget(widget)
         widget.deleteLater()
+        if not self._verses:
+            self._add_verse(DEFAULT_TIMESTAMP, "")       # always somewhere to type
         self._select_verse(self.current_verse_index)
         QTimer.singleShot(50, self._update_timeline)
         self._mark_dirty()
 
     def _replace_all_verses(self, lines: list[tuple[str, str]]) -> None:
-        """Wipe the current verse list and replace it with *lines*
-        ((timestamp_str, text) pairs) — no confirmation. The primitive
-        behind both Get Lyrics (an intentional replace) and Clear All
-        (which adds its own confirmation before calling this with [])."""
-        for v in self._verses:
+        """Make the editor show exactly *lines* ((timestamp_str, text)
+        pairs) — no confirmation. Existing line widgets are reused (building
+        them is what made loading a song slow), extras are removed. The
+        undo history is dropped: its entries would point at reused rows."""
+        for v in self._verses[len(lines):]:
             self.lyrics_layout.removeWidget(v)
             v.deleteLater()
-        self._verses.clear()
+        del self._verses[len(lines):]
+        self._undo_stack.clear()
         self._playback_highlight_verse = None
         self.current_verse_index = 0
-        for ts_str, content in lines:
-            self._add_verse(ts_str, content)
+        for i, (ts_str, content) in enumerate(lines):
+            if i < len(self._verses):
+                verse = self._verses[i]
+                verse.set_timestamp(ts_str)
+                verse.verse_text.blockSignals(True)
+                verse.verse_text.setText(content)
+                verse.verse_text.blockSignals(False)
+                verse.set_active(False)
+                verse.set_playing(False)
+            else:
+                self._add_verse(ts_str, content)
         self._update_timeline()
         self._mark_dirty()
         self._update_no_lyrics_card()
@@ -969,15 +1009,18 @@ class LrcSyncApp(QMainWindow):
             QMessageBox.StandardButton.Cancel,
         ) != QMessageBox.StandardButton.Yes:
             return
-        self._replace_all_verses([])
+        self._replace_all_verses([(DEFAULT_TIMESTAMP, "")])   # one blank row to type into
 
     def _select_verse(self, index: int) -> None:
         if not self._verses:
             return
         index = max(0, min(index, len(self._verses) - 1))
-        for i, verse in enumerate(self._verses):
-            verse.set_active(i == index)
-        self._verses[index]  # ensure in-range
+        # Only the old and the new row change; restyling every row on each
+        # key press made S and Up/Down take ~100 ms.
+        old = self.current_verse_index
+        if 0 <= old < len(self._verses) and old != index:
+            self._verses[old].set_active(False)
+        self._verses[index].set_active(True)
         self.scroll_area.ensureWidgetVisible(self._verses[index], 0, 300)
         self.current_verse_index = index
         self.timeline.set_active_index(index)
@@ -999,11 +1042,8 @@ class LrcSyncApp(QMainWindow):
 
     def _sync_verse(self, verse: Verse) -> None:
         """Stamp *verse* with the current playback position - SYNC_OFFSET."""
-        # Save old timestamp to undo stack before overwriting.
         if verse in self._verses:
-            self._undo_stack.append((verse, verse.get_timestamp()))
-            if len(self._undo_stack) > MAX_UNDO:
-                self._undo_stack.pop(0)
+            self._push_undo([(verse, verse.get_timestamp())])
 
         ms = max(0, self.player.get_time() - SYNC_OFFSET_MS)
         verse.set_timestamp(ms_to_lrc_timestamp(ms))
@@ -1017,23 +1057,28 @@ class LrcSyncApp(QMainWindow):
         self._sync_verse(self._verses[self.current_verse_index])
         self._select_verse(self.current_verse_index + 1)
 
-    def _undo_last_sync(self) -> None:
-        """Revert the most recent sync operation (Ctrl-Z).
+    def _push_undo(self, entries: list[tuple[Verse, str]]) -> None:
+        """Record one undoable operation (all its lines restore together)."""
+        if entries:
+            self._undo_stack.append(entries)
+            if len(self._undo_stack) > MAX_UNDO:
+                self._undo_stack.pop(0)
 
-        Undo entries are keyed by verse identity rather than list index, so
-        a reorder (sort) or a delete of an unrelated line can't make this
-        restore a timestamp onto the wrong verse. Entries for verses that
-        no longer exist are skipped rather than applied.
-        """
+    def _undo_last_sync(self) -> None:
+        """Undo the last timing change (Ctrl-Z): a sync, a whole shift, or a
+        timeline drag. Entries for lines deleted since are skipped."""
         while self._undo_stack:
-            verse, old_ts = self._undo_stack.pop()
-            if verse not in self._verses:
+            entries = [(v, ts) for v, ts in self._undo_stack.pop() if v in self._verses]
+            if not entries:
                 continue
-            idx = self._verses.index(verse)
-            verse.set_timestamp(old_ts)
+            for verse, old_ts in entries:
+                verse.set_timestamp(old_ts)
             self._update_timeline()
             self._mark_dirty()
-            self.status_bar.setText(f"Undid sync on line {idx + 1}.")
+            if len(entries) == 1:
+                self.status_bar.setText(f"Undid the change on line {self._verses.index(entries[0][0]) + 1}.")
+            else:
+                self.status_bar.setText(f"Undid the change on {len(entries)} lines.")
             return
         self.status_bar.setText("Nothing to undo.")
 
@@ -1067,12 +1112,9 @@ class LrcSyncApp(QMainWindow):
         )
         if not ok or delta == 0:
             return
+        self._push_undo([(v, v.get_timestamp()) for v in self._verses])
         for verse in self._verses:
-            old_ts = verse.get_timestamp()
-            self._undo_stack.append((verse, old_ts))
-            if len(self._undo_stack) > MAX_UNDO:
-                self._undo_stack.pop(0)
-            new_ms = max(0, parse_lrc_timestamp(old_ts) + delta)
+            new_ms = max(0, parse_lrc_timestamp(verse.get_timestamp()) + delta)
             verse.set_timestamp(ms_to_lrc_timestamp(new_ms))
         self._update_timeline()
         self._mark_dirty()
@@ -1086,6 +1128,10 @@ class LrcSyncApp(QMainWindow):
         self, updates: list[tuple[int, int]]
     ) -> None:
         """Apply bulk timestamp changes originating from a timeline drag."""
+        self._push_undo([
+            (self._verses[i], self._verses[i].get_timestamp())
+            for i, _ms in updates if 0 <= i < len(self._verses)
+        ])
         for index, new_ms in updates:
             if 0 <= index < len(self._verses):
                 self._verses[index].set_timestamp(ms_to_lrc_timestamp(new_ms))
@@ -1100,13 +1146,46 @@ class LrcSyncApp(QMainWindow):
         if not self.current_file_path:
             return
         lrc_path = os.path.splitext(self.current_file_path)[0] + ".lrc"
-        lrc_text = "".join(f"{v.get_timestamp()} {v.get_verse_text()}\n" for v in self._verses)
+        if self._lrc_load_failed and os.path.exists(lrc_path) and QMessageBox.question(
+            self, "Replace Unreadable Lyrics?",
+            "The existing lyrics file couldn't be read, so the editor doesn't show what's in it. "
+            "Saving replaces it. Save anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        rows = [(v.get_timestamp(), v.get_verse_text()) for v in self._verses]
+        if not any(text.strip() for _ts, text in rows):
+            # Nothing to save: don't write an empty file that would count as
+            # lyrics (and spread to every synced device). Saving after Clear
+            # all removes the old file, recoverably.
+            if os.path.exists(lrc_path):
+                ok, _where = QFile.moveToTrash(lrc_path)
+                status = "Lyrics removed (the old file is in the trash)." if ok else "Couldn't remove the old lyrics file."
+            else:
+                status = "Nothing to save yet: there are no lyrics."
+            self._dirty = False
+            self._update_title()
+            self.status_bar.setText(status)
+            self.library_panel.refresh_status(self.current_file_path)
+            return
+        lrc_text = "".join(f"{line}\n" for line in self._lrc_meta)
+        lrc_text += "".join(f"{ts} {text}\n" for ts, text in rows)
+        tmp_path = lrc_path + ".part"
         try:
-            with open(lrc_path, "w", encoding="utf-8") as fh:
+            # Write beside it, then swap: a crash or a full disk never leaves
+            # a half-written file for Syncthing to spread.
+            with open(tmp_path, "w", encoding="utf-8") as fh:
                 fh.write(lrc_text)
+            os.replace(tmp_path, lrc_path)
         except OSError as exc:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
             QMessageBox.critical(self, "Error", f"Could not save file:\n{exc}")
             return
+        self._lrc_load_failed = False
 
         status = f"Saved: {os.path.basename(lrc_path)}"
         if _as_bool(self.settings.value("embed_lyrics", False), False):
@@ -1133,13 +1212,15 @@ class LrcSyncApp(QMainWindow):
             use_ytmusic=_as_bool(self.settings.value("lyrics_ytmusic", False), False),
         )
         QTimer.singleShot(0, dialog.run_search)
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.chosen_text:
-            self._on_search_result(dialog.chosen_text)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        chosen = dialog.chosen_text
+        dialog.deleteLater()
+        if accepted and chosen:
+            self._on_search_result(chosen)
 
     def _on_search_result(self, result: str) -> None:
         if result:
-            self._replace_all_verses([])
-            self._parse_and_add_lyrics(result)
+            self._replace_all_verses(self._lines_from_lrc(result) or [(DEFAULT_TIMESTAMP, "")])
             self._mark_dirty()
             self._update_no_lyrics_card()
             self.status_bar.setText("Lyrics found. Check them and press Ctrl+S to save.")
@@ -1147,22 +1228,21 @@ class LrcSyncApp(QMainWindow):
             QMessageBox.information(self, "Sorry", "No lyrics found.")
             self.status_bar.setText("Ready")
 
-    def _parse_and_add_lyrics(self, text: str) -> None:
+    def _lines_from_lrc(self, text: str) -> list[tuple[str, str]]:
+        """(timestamp, text) rows from LRC text, with any [offset:] applied.
+        By the LRC convention a positive offset makes lyrics appear earlier."""
         lines, offset_ms = parse_lrc_file(text)
+        if not offset_ms:
+            return lines
+        self.status_bar.setText(f"Applied the file's timing offset ({offset_ms:+d} ms).")
+        return [
+            (ts if ts == DEFAULT_TIMESTAMP else ms_to_lrc_timestamp(max(0, parse_lrc_timestamp(ts) - offset_ms)), content)
+            for ts, content in lines
+        ]
 
-        if offset_ms:
-            self.status_bar.setText(
-                f"Applied LRC global offset: {offset_ms:+d} ms"
-            )
-
-        for ts_str, content in lines:
-            # Apply global offset if present.
-            if offset_ms:
-                base_ms  = parse_lrc_timestamp(ts_str)
-                adjusted = max(0, base_ms + offset_ms)
-                ts_str   = ms_to_lrc_timestamp(adjusted)
+    def _parse_and_add_lyrics(self, text: str) -> None:
+        for ts_str, content in self._lines_from_lrc(text):
             self._add_verse(ts_str, content)
-
         self._update_timeline()
 
     # ==================================================================
@@ -1611,6 +1691,7 @@ class LrcSyncApp(QMainWindow):
         self._qa_thread.failed.connect(lambda msg: dialog.set_status(f"Failed: {msg}"))
         self._qa_thread.start()
         dialog.exec()
+        dialog.deleteLater()
 
     # ==================================================================
     # Unsaved-changes tracking & window state
@@ -1670,6 +1751,18 @@ class LrcSyncApp(QMainWindow):
         ) != QMessageBox.StandardButton.Yes:
             event.ignore()
             return
+        if self._convert_thread is not None and self._convert_thread.isRunning():
+            if QMessageBox.question(
+                self, "Conversion Running",
+                "Files are still being converted to Opus. Quitting stops after the current "
+                "file is cleaned up (it stays as it was). Quit anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Cancel,
+            ) != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self._convert_thread.request_cancel()
+            self._convert_thread.wait(10_000)
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
 
@@ -1754,16 +1847,23 @@ class LrcSyncApp(QMainWindow):
             self.workspace.setCurrentIndex(WORKSPACE_EDITOR)
 
         lrc_path = os.path.splitext(path)[0] + ".lrc"
-        self._replace_all_verses([])
+        self._lrc_meta = []
+        self._lrc_load_failed = False
+        lines: list[tuple[str, str]] = []
         if os.path.exists(lrc_path):
             try:
-                with open(lrc_path, encoding="utf-8") as fh:
-                    self._parse_and_add_lyrics(fh.read())
-            except (OSError, UnicodeDecodeError) as exc:
-                self.status_bar.setText(f"Could not read LRC: {exc}")
-        else:
-            self._add_verse(DEFAULT_TIMESTAMP, "")
-            self._update_timeline()
+                text = read_lrc_text(lrc_path)
+                self._lrc_meta = lrc_metadata_lines(text)
+                lines = self._lines_from_lrc(text)
+            except OSError as exc:
+                self._lrc_load_failed = True
+                self.status_bar.setText(f"Could not read the lyrics file: {exc}")
+        if resume_at is None:
+            duration = audio_duration_ms(path)
+            self.duration_ms = 1
+            if duration:
+                self._on_duration_changed(duration)
+        self._replace_all_verses(lines or [(DEFAULT_TIMESTAMP, "")])
         self.karaoke_prev.setText("")
         self.karaoke_label.setText("♪" if self._verses and self._verses[0].get_verse_text() else "No lyrics yet")
         self.karaoke_next.setText("")
@@ -1774,7 +1874,8 @@ class LrcSyncApp(QMainWindow):
         self._dirty = False
         self._update_title()
         self._update_no_lyrics_card()
-        self.status_bar.setText(f"Loaded: {self.song_filename}")
+        if not self._lrc_load_failed:
+            self.status_bar.setText(f"Loaded: {self.song_filename}")
 
     def _play(self) -> None:
         if self.song_is_loaded:

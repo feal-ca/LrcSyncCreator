@@ -13,6 +13,7 @@ import base64
 import os
 import shutil
 import subprocess
+import time
 
 import mutagen
 from mutagen.flac import FLAC, Picture
@@ -138,12 +139,14 @@ def _length(path: str, opus: bool = False) -> float | None:
 
 
 def convert_to_opus(src: str, bitrate_kbps: int = 192,
-                    delete_source: bool = True) -> str:
+                    delete_source: bool = True,
+                    should_cancel=None) -> str:
     """Encode ``src`` to ``<stem>.opus`` beside it and return that path.
 
     Refuses to pick another name when the target exists, because the ``.lrc``
     pairing depends on the stem. The original is removed only after the new
-    file has been verified and moved into place.
+    file has been verified and moved into place. *should_cancel()*, polled
+    while ffmpeg runs, stops it and cleans up (raises ConversionError).
     """
     if not ffmpeg_available():
         raise ConversionError("ffmpeg is not installed")
@@ -165,13 +168,23 @@ def convert_to_opus(src: str, bitrate_kbps: int = 192,
     ]
     try:
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=_ENCODE_TIMEOUT_S)
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        except OSError as exc:
             raise ConversionError(f"ffmpeg failed to run: {exc}") from exc
+        deadline = time.monotonic() + _ENCODE_TIMEOUT_S
+        while proc.poll() is None:
+            if should_cancel is not None and should_cancel():
+                proc.kill()
+                proc.wait()
+                raise ConversionError("Cancelled")
+            if time.monotonic() > deadline:
+                proc.kill()
+                proc.wait()
+                raise ConversionError("ffmpeg took too long")
+            time.sleep(0.2)
+        _out, err = proc.communicate()
         if proc.returncode != 0:
-            raise ConversionError(
-                f"ffmpeg failed: {(proc.stderr or '').strip()[-300:]}")
+            raise ConversionError(f"ffmpeg failed: {(err or '').strip()[-300:]}")
 
         _carry_over_metadata(src, tmp)
 
