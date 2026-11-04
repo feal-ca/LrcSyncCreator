@@ -1,30 +1,30 @@
-"""lyrics_fetch.py — duration-aware lyrics lookup built around LRCLIB's API.
+"""lyrics_fetch.py — duration-aware lyrics lookup across several sources.
 
-The old approach (``syncedlyrics.search("<artist> <title>")``) takes the first
-fuzzy hit without ever looking at the track's length, so live cuts and other
-versions slip through, and queries built from filenames such as
-"01 - Manu Chao - Clandestino" match poorly. This module instead reads the
-tags (falling back to the filename), then escalates:
+Reads the song's tags (falling back to the file name), then:
 
-1. LRCLIB ``/get`` with the exact tags and duration (LRCLIB matches within a
-   couple of seconds, so a hit is almost certainly the right recording), then
-   again with a cleaned title / primary artist.
-2. LRCLIB ``/search``, filtered by title/artist similarity and by duration
-   (closest within 3 s first, then within 8 s). Lyrics whose timestamps run
-   past the track's length are rejected.
-3. ``syncedlyrics`` (Musixmatch, NetEase, Megalobiz) as a last synced source.
-4. Optionally, plain (unsynced) lyrics, reported as ``synced=False`` so the
-   caller never mistakes them for a timed .lrc.
+1. LRCLIB ``/get`` with the exact tags and duration, then ``/search``
+   (by fields and by free text), filtered by title/artist similarity and
+   duration. Lyrics whose timestamps run past the track are rejected.
+2. A hit is cross-checked against Megalobiz. If they disagree, QQ Music
+   and NetEase are asked too and the version most sources agree on wins
+   (LRCLIB entries are sometimes many seconds off). With nothing to
+   compare against, the LRCLIB hit is used as before.
+3. Without an LRCLIB hit, Megalobiz, QQ Music, NetEase (and YouTube Music,
+   when turned on) are tried in that order; one plausible match is enough.
+4. Optionally, plain (unsynced) lyrics: LRCLIB's, else Genius via
+   syncedlyrics, reported as ``synced=False``.
 
-Every network step fails soft: an error just moves on to the next step.
-This module has no Qt dependency; all HTTP goes through ``_http_get`` so tests
-can replace it.
+Credit lines ("作词 : …", "Lyrics by: …") are stripped from whatever is
+returned. Every network step fails soft. No Qt; all LRCLIB HTTP goes
+through ``_http_get`` and the other sources through ``lyrics_providers``,
+so tests can replace both.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import time
 from dataclasses import dataclass
 
 import mutagen
@@ -32,10 +32,16 @@ import requests
 import syncedlyrics
 from rapidfuzz import fuzz
 
+import lyrics_providers
+
 LRCLIB_API = "https://lrclib.net/api"
 USER_AGENT = "LRC Studio (https://github.com/feal-ca/LrcSync)"
 HTTP_TIMEOUT_S = 10
-SYNCEDLYRICS_PROVIDERS = ["Musixmatch", "NetEase", "Megalobiz"]
+# Plain-lyrics fallback only. Musixmatch is never used: it serves decoy
+# lyrics to unofficial clients.
+PLAIN_FALLBACK_PROVIDERS = ["Genius"]
+# When sources disagree, prefer the cleanest text.
+_SOURCE_RANK = {"lrclib": 5, "megalobiz": 4, "ytmusic": 3, "qq": 2, "netease": 1}
 
 TITLE_MIN_RATIO = 80
 ARTIST_MIN_RATIO = 70
@@ -206,12 +212,21 @@ def primary_artist(artist: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _http_get(url: str, params: dict) -> requests.Response:
-    return requests.get(
-        url,
-        params=params,
-        headers={"User-Agent": USER_AGENT},
-        timeout=HTTP_TIMEOUT_S,
-    )
+    """GET with one retry: a momentary network blip (DNS, timeout) used to
+    leave a song "without lyrics" that LRCLIB actually has."""
+    for attempt in (1, 2):
+        try:
+            return requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": USER_AGENT},
+                timeout=HTTP_TIMEOUT_S,
+            )
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 2:
+                raise
+            time.sleep(1.5)
+    raise AssertionError("unreachable")
 
 
 def _candidate_from_json(item: dict) -> LyricsCandidate | None:
@@ -332,9 +347,14 @@ def candidate_matches(
 ) -> bool:
     if _title_ratio(c, info) < TITLE_MIN_RATIO:
         return False
-    if info.artist and _artist_ratio(c, info) < ARTIST_MIN_RATIO:
-        return False
     diff = _duration_diff(c, info)
+    if not info.artist:
+        # Only a title to go on ("Hello.mp3"): many songs share it, so the
+        # title must match closely and the length almost exactly.
+        close_title = fuzz.ratio(_norm(clean_title(c.title)), _norm(clean_title(info.title))) >= 90
+        return close_title and diff is not None and diff <= EXACT_DURATION_DIFF_S
+    if _artist_ratio(c, info) < ARTIST_MIN_RATIO:
+        return False
     return diff is None or diff <= max_duration_diff_s
 
 
@@ -399,15 +419,61 @@ def _pick_synced(
     return None
 
 
-def fetch_best_lyrics(info: TrackInfo, allow_plain: bool = True) -> LyricsResult | None:
+def _from_provider(d: dict) -> LyricsCandidate:
+    return LyricsCandidate(
+        source=d.get("source", ""), artist=d.get("artist") or "", title=d.get("title") or "",
+        album=d.get("album") or "", duration_s=d.get("duration_s"), synced=d.get("synced"),
+        plain=d.get("plain"), ref=str(d.get("ref") or ""),
+    )
+
+
+def _provider_matches(name: str, info: TrackInfo, artist: str, title: str, max_fetch: int = 2) -> list[LyricsCandidate]:
+    """Plausible synced candidates from one extra source."""
+    fn = getattr(lyrics_providers, f"{name}_candidates")
+    try:
+        found = [_from_provider(d) for d in fn(artist, title, info.duration_s, max_fetch=max_fetch)]
+    except Exception:
+        return []
+    return [
+        c for c in found
+        if c.has_synced and candidate_matches(c, info) and is_plausible_synced(c.synced or "", info.duration_s)
+    ]
+
+
+def _agree(a: LyricsCandidate, b: LyricsCandidate) -> bool:
+    try:
+        return bool(lyrics_providers.crosscheck(a.synced or "", b.synced or "")["agree"])
+    except Exception:
+        return False
+
+
+def _most_agreed(cands: list[LyricsCandidate], info: TrackInfo) -> LyricsCandidate:
+    """The candidate the most other sources agree with; ties go to the
+    cleanest source, then the closest match."""
+    def key(i: int) -> tuple:
+        c = cands[i]
+        support = sum(1 for j, o in enumerate(cands) if j != i and _agree(c, o))
+        return (support, _SOURCE_RANK.get(c.source, 0), _score(c, info))
+    return cands[max(range(len(cands)), key=key)]
+
+
+def _synced_result(c: LyricsCandidate) -> LyricsResult:
+    text = lyrics_providers.clean_lrc(c.synced or "")
+    return LyricsResult(text, True, c.source, c)
+
+
+def fetch_best_lyrics(
+    info: TrackInfo, allow_plain: bool = True, use_ytmusic: bool = False,
+) -> LyricsResult | None:
     title = clean_title(info.title)
     artist = primary_artist(info.artist)
     if not title:
         return None
 
     plain_pool: list[LyricsCandidate] = []
+    lrclib_pick: LyricsCandidate | None = None
 
-    # 1. Exact-signature lookups.
+    # 1. LRCLIB: exact signature first, then search.
     attempts = [info]
     if (title, artist) != (info.title, info.artist):
         attempts.append(TrackInfo(artist, title, "", info.duration_s))
@@ -419,32 +485,34 @@ def fetch_best_lyrics(info: TrackInfo, allow_plain: bool = True) -> LyricsResult
         if cand is None:
             continue
         if cand.has_synced and is_plausible_synced(cand.synced or "", info.duration_s):
-            return LyricsResult(cand.synced or "", True, "lrclib", cand)
+            lrclib_pick = cand
+            break
         if cand.plain:
             plain_pool.append(cand)
 
-    # 2. Fuzzy LRCLIB search, gated on text and duration.
     matching: list[LyricsCandidate] = []
-    try:
-        matching = [
-            c for c in _search_lrclib(artist, title) if candidate_matches(c, info)
-        ]
-        best = _pick_synced(matching, info)
-        if best is not None:
-            return LyricsResult(best.synced or "", True, "lrclib", best)
-    except Exception:
-        pass
+    if lrclib_pick is None:
+        try:
+            matching = [c for c in _search_lrclib(artist, title) if candidate_matches(c, info)]
+            lrclib_pick = _pick_synced(matching, info)
+        except Exception:
+            pass
 
-    # 3. Other providers via syncedlyrics.
-    term = f"{title} {artist}".strip()
-    try:
-        text = syncedlyrics.search(
-            term, synced_only=True, providers=SYNCEDLYRICS_PROVIDERS
-        )
-        if text and is_plausible_synced(text, info.duration_s):
-            return LyricsResult(text, True, "syncedlyrics")
-    except Exception:
-        pass
+    # 2. With an LRCLIB hit: confirm it, or let other sources overrule it.
+    if lrclib_pick is not None:
+        others = _provider_matches("megalobiz", info, artist, title, max_fetch=1)
+        if not others or any(_agree(lrclib_pick, o) for o in others):
+            return _synced_result(lrclib_pick)
+        others += _provider_matches("qq", info, artist, title)
+        others += _provider_matches("netease", info, artist, title)
+        return _synced_result(_most_agreed([lrclib_pick] + others, info))
+
+    # 3. Without one: other sources, first that has a plausible match.
+    sources = ["megalobiz", "qq", "netease"] + (["ytmusic"] if use_ytmusic else [])
+    for name in sources:
+        found = _provider_matches(name, info, artist, title)
+        if found:
+            return _synced_result(_most_agreed(found, info))
 
     # 4. Plain lyrics, clearly flagged as unsynced.
     if allow_plain:
@@ -452,8 +520,9 @@ def fetch_best_lyrics(info: TrackInfo, allow_plain: bool = True) -> LyricsResult
         if plain_pool:
             best = plain_pool[0]
             return LyricsResult(best.plain or "", False, "lrclib", best)
+        term = f"{title} {artist}".strip()
         try:
-            text = syncedlyrics.search(term, plain_only=True)
+            text = syncedlyrics.search(term, plain_only=True, providers=PLAIN_FALLBACK_PROVIDERS)
             if text and text.strip():
                 return LyricsResult(text, False, "syncedlyrics")
         except Exception:
@@ -462,9 +531,20 @@ def fetch_best_lyrics(info: TrackInfo, allow_plain: bool = True) -> LyricsResult
 
 
 def search_candidates(
-    artist: str, title: str, duration_s: float | None = None
+    artist: str, title: str, duration_s: float | None = None, use_ytmusic: bool = False,
 ) -> list[LyricsCandidate]:
-    """Unfiltered, ranked LRCLIB results for a manual picker."""
+    """Every source's results in one ranked list, for the manual picker
+    (not filtered: the user judges by length and a preview)."""
+    info = TrackInfo(artist, title, "", duration_s)
     cands = _search_lrclib(artist, title)
-    ranked = rank_candidates(cands, TrackInfo(artist, title, "", duration_s))
+    for name in ["megalobiz", "qq", "netease"] + (["ytmusic"] if use_ytmusic else []):
+        fn = getattr(lyrics_providers, f"{name}_candidates")
+        try:
+            cands += [_from_provider(d) for d in fn(artist, title, duration_s, max_fetch=2)]
+        except Exception:
+            continue
+    for c in cands:
+        if c.synced:
+            c.synced = lyrics_providers.clean_lrc(c.synced)
+    ranked = rank_candidates(_merge(cands), info)
     return ranked[:MAX_PICKER_RESULTS]

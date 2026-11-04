@@ -223,7 +223,7 @@ def test_batch_download_lyrics_accepts_paths_directly(window, monkeypatch):
         # which PyQt turns into a fatal C++ abort rather than a normal
         # Python exception — the same issue test_workspace.py's
         # _FakeFetchThread had (see that file's docstring).
-        def __init__(self, files, embed=False):
+        def __init__(self, files, embed=False, **_kwargs):
             started.append(files)
         progress = type("Signal", (), {"connect": lambda self, fn: None})()
         file_done = type("Signal", (), {"connect": lambda self, fn: None})()
@@ -244,7 +244,7 @@ def test_second_lyrics_batch_waits_for_the_running_one(window, monkeypatch):
     started = []
 
     class FakeThread:
-        def __init__(self, files, embed=False):
+        def __init__(self, files, embed=False, **_kwargs):
             self.files = files
             self.running = True
             started.append(files)

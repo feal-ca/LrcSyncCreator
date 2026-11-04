@@ -8,3 +8,7 @@
 #   pip install -r requirements-optional.txt
 #
 faster-whisper>=1.2,<2
+
+# ytmusicapi: lets "Find lyrics" also ask YouTube Music (Settings → Downloads),
+# which covers more Spanish and Catalan songs. Unofficial API, off by default.
+ytmusicapi>=1.12,<2

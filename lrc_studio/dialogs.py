@@ -173,9 +173,15 @@ class SettingsDialog(QDialog):
         self.rename_check = QCheckBox("Rename downloads to “Artist - Title” from their tags")
         self.rename_check.setChecked(_as_bool(settings.value("rename_downloads", True), True))
         layout.addWidget(self.rename_check)
-        self.embed_check = QCheckBox("Also write fetched lyrics into the audio file's tags")
+        self.embed_check = QCheckBox("Also write lyrics into the audio file's tags")
         self.embed_check.setChecked(_as_bool(settings.value("embed_lyrics", False), False))
         layout.addWidget(self.embed_check)
+        self.ytmusic_check = QCheckBox("Also look for lyrics on YouTube Music (slower, unofficial)")
+        self.ytmusic_check.setToolTip(
+            "Covers more Spanish and Catalan songs. Needs: pip install -r requirements-optional.txt"
+        )
+        self.ytmusic_check.setChecked(_as_bool(settings.value("lyrics_ytmusic", False), False))
+        layout.addWidget(self.ytmusic_check)
 
         layout.addSpacing(6)
         layout.addWidget(_section("Soulseek"))
@@ -228,6 +234,7 @@ class SettingsDialog(QDialog):
         s.setValue("opus_bitrate", int(self.bitrate_combo.currentData()))
         s.setValue("rename_downloads", self.rename_check.isChecked())
         s.setValue("embed_lyrics", self.embed_check.isChecked())
+        s.setValue("lyrics_ytmusic", self.ytmusic_check.isChecked())
         self.accept()
 
 
@@ -320,18 +327,20 @@ class SoulseekSearchDialog(QDialog):
 
 
 class LyricsPickerDialog(QDialog):
-    """Get Lyrics: look the song up, compare candidates, preview, choose.
+    """Find lyrics: look the song up everywhere, compare, preview, choose.
 
-    Candidates come from LRCLIB ranked by how well title, artist and
-    duration match the loaded file; the length column shows the
-    difference from the real track, which is the quickest tell for a
-    live cut or a different edit. "Other sources" runs the older
-    multi-provider search for songs LRCLIB doesn't have.
+    Candidates from LRCLIB, Megalobiz, QQ Music and NetEase (and YouTube
+    Music when turned on) come back in one list, ranked by how well
+    title, artist and duration match the loaded file. The length column
+    shows the difference from the real track, the quickest tell for a
+    live cut or a different edit.
     """
 
-    def __init__(self, artist: str, title: str, duration_s: float | None, parent=None) -> None:
+    def __init__(self, artist: str, title: str, duration_s: float | None, parent=None,
+                 use_ytmusic: bool = False) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Get lyrics")
+        self.setWindowTitle("Find lyrics")
+        self._use_ytmusic = use_ytmusic
         self.resize(940, 580)
         self.chosen_text: str = ""
         self._duration_s = duration_s
@@ -349,15 +358,11 @@ class LyricsPickerDialog(QDialog):
         self.search_button = QPushButton("Search")
         self.search_button.setProperty("variant", "primary")
         self.search_button.clicked.connect(self.run_search)
-        self.other_button = QPushButton("Other sources")
-        self.other_button.setToolTip("Musixmatch, NetEase and others, first match only")
-        self.other_button.clicked.connect(self.run_other_sources)
         for w in (self.artist_input, self.title_input):
             w.returnPressed.connect(self.run_search)
         row.addWidget(self.artist_input, stretch=2)
         row.addWidget(self.title_input, stretch=3)
         row.addWidget(self.search_button)
-        row.addWidget(self.other_button)
         layout.addLayout(row)
 
         self.status_label = QLabel("")
@@ -365,8 +370,8 @@ class LyricsPickerDialog(QDialog):
         layout.addWidget(self.status_label)
 
         split = QSplitter(Qt.Orientation.Horizontal)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Song", "Album", "Length", "Timing"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Title", "Artist", "Source", "Length", "Timing"])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(30)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -377,9 +382,9 @@ class LyricsPickerDialog(QDialog):
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(1, 150)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.resizeSection(1, 130)
+        for col in (2, 3, 4):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemSelectionChanged.connect(self._preview_selected)
         self.table.itemDoubleClicked.connect(lambda _i: self._accept_selected())
         split.addWidget(self.table)
@@ -412,30 +417,16 @@ class LyricsPickerDialog(QDialog):
         if not title:
             self.status_label.setText("Enter at least a title.")
             return
-        self.status_label.setText("Searching LRCLIB…")
+        self.status_label.setText("Searching LRCLIB, Megalobiz, QQ Music and NetEase…")
         self.search_button.setEnabled(False)
-        thread = LyricsCandidatesThread(artist, title, self._duration_s)
+        thread = LyricsCandidatesThread(artist, title, self._duration_s, use_ytmusic=self._use_ytmusic)
         thread.results_ready.connect(self._show_candidates)
         thread.failed.connect(lambda msg: self._search_done(f"Search failed: {msg}"))
         self._threads.append(thread)
         thread.start()
 
-    def run_other_sources(self) -> None:
-        from workers import LyricsSearchThread
-
-        query = f"{self.title_input.text().strip()} {self.artist_input.text().strip()}".strip()
-        if not query:
-            return
-        self.status_label.setText("Searching other sources…")
-        self.other_button.setEnabled(False)
-        thread = LyricsSearchThread(query)
-        thread.result_ready.connect(self._show_other_result)
-        self._threads.append(thread)
-        thread.start()
-
     def _search_done(self, message: str) -> None:
         self.search_button.setEnabled(True)
-        self.other_button.setEnabled(True)
         self.status_label.setText(message)
 
     def _show_candidates(self, candidates: list) -> None:
@@ -445,30 +436,14 @@ class LyricsPickerDialog(QDialog):
             self._append_candidate(c)
         if self._candidates:
             synced = sum(1 for c in self._candidates if c.has_synced)
+            sources = len({c.source for c in self._candidates})
             self._search_done(
-                f"{len(self._candidates)} results, {synced} with synced timing. Closest match first."
+                f"{len(self._candidates)} results from {sources} source{'s' if sources != 1 else ''}, "
+                f"{synced} with synced timing. Closest match first."
             )
             self.table.selectRow(0)
         else:
-            self._search_done("LRCLIB has nothing for this. Try Other sources, or fix the title.")
-
-    def _show_other_result(self, text: str) -> None:
-        from lyrics_fetch import LyricsCandidate, is_plausible_synced
-
-        if not text.strip():
-            self._search_done("Other sources found nothing either.")
-            return
-        synced = is_plausible_synced(text, self._duration_s)
-        cand = LyricsCandidate(
-            source="other", artist=self.artist_input.text().strip(),
-            title=self.title_input.text().strip(), album="", duration_s=None,
-            synced=text if synced else None, plain=None if synced else text,
-        )
-        self._candidates.insert(0, cand)
-        self.table.insertRow(0)
-        self._fill_row(0, cand)
-        self.table.selectRow(0)
-        self._search_done("Found a match on another source (shown first).")
+            self._search_done("Nothing found. Try a shorter title, or check the artist.")
 
     def _append_candidate(self, c) -> None:
         row = self.table.rowCount()
@@ -476,10 +451,12 @@ class LyricsPickerDialog(QDialog):
         self._fill_row(row, c)
 
     def _fill_row(self, row: int, c) -> None:
-        song = QTableWidgetItem(f"{c.artist} - {c.title}" if c.artist else c.title)
-        song.setToolTip(f"Source: {c.source}")
-        album = QTableWidgetItem(c.album)
-        album.setForeground(theme_color(theme.TEXT_2))
+        song = QTableWidgetItem(c.title)
+        song.setToolTip(f"{c.artist} - {c.title}" + (f"\nAlbum: {c.album}" if c.album else ""))
+        artist = QTableWidgetItem(c.artist)
+        artist.setForeground(theme_color(theme.TEXT_2))
+        source = QTableWidgetItem(_SOURCE_NAMES.get(c.source, c.source))
+        source.setForeground(theme_color(theme.TEXT_2))
         if c.duration_s:
             m, s = divmod(int(round(c.duration_s)), 60)
             length_text = f"{m}:{s:02d}"
@@ -494,7 +471,7 @@ class LyricsPickerDialog(QDialog):
             length = QTableWidgetItem("")
         timing = QTableWidgetItem("Synced" if c.has_synced else "Text only")
         timing.setForeground(theme_color(theme.OK if c.has_synced else theme.PLAIN))
-        for col, item in enumerate((song, album, length, timing)):
+        for col, item in enumerate((song, artist, source, length, timing)):
             self.table.setItem(row, col, item)
 
     def _preview_selected(self) -> None:
@@ -523,6 +500,10 @@ class LyricsPickerDialog(QDialog):
 
 
 _LINGERING: set = set()
+_SOURCE_NAMES = {
+    "lrclib": "LRCLIB", "megalobiz": "Megalobiz", "qq": "QQ Music",
+    "netease": "NetEase", "ytmusic": "YouTube Music", "syncedlyrics": "Genius",
+}
 
 
 def theme_color(hex_color: str):

@@ -90,3 +90,19 @@ def test_settings_dialog_saves_the_soulseek_account(qapp, tmp_path):
     assert settings.value("soulseek_username") == "Me"
     assert settings.value("soulseek_password") == "pw"
     assert settings.value("share_library") in (False, "false")
+
+
+def test_lyrics_picker_lists_every_source_in_one_table(qapp):
+    from lyrics_fetch import LyricsCandidate
+
+    dialog = dialogs.LyricsPickerDialog("Manu Chao", "Clandestino", 150.0)
+    dialog._show_candidates([
+        LyricsCandidate("lrclib", "Manu Chao", "Clandestino", "", 150.0, "[00:01.00] a\n", None, "1"),
+        LyricsCandidate("qq", "Manu Chao", "Clandestino (Live)", "", 190.0, "[00:01.00] b\n", None, "2"),
+    ])
+
+    assert not hasattr(dialog, "other_button")
+    headers = [dialog.table.horizontalHeaderItem(i).text() for i in range(dialog.table.columnCount())]
+    assert headers == ["Title", "Artist", "Source", "Length", "Timing"]
+    assert [dialog.table.item(r, 2).text() for r in range(2)] == ["LRCLIB", "QQ Music"]
+    assert dialog.table.item(1, 0).text() == "Clandestino (Live)"

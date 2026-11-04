@@ -49,7 +49,14 @@ def _http_get(url: str, params: dict | None = None, headers: dict | None = None)
     if wait > 0:
         time.sleep(wait)
     h = {"User-Agent": USER_AGENT, **(headers or {})}
-    return requests.get(url, params=params, headers=h, timeout=TIMEOUT_S)
+    for attempt in (1, 2):      # one retry: a DNS or timeout blip shouldn't cost a song its lyrics
+        try:
+            return requests.get(url, params=params, headers=h, timeout=TIMEOUT_S)
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt == 2:
+                raise
+            time.sleep(1.5)
+    raise AssertionError("unreachable")
 
 
 def _never_raises(fn):
@@ -91,7 +98,7 @@ def _by_duration(items, duration_s):
 
 
 # ---------------------------------------------------------- LRC clean-up ---
-_ID_TAG = re.compile(r"^\s*\[(?:ti|ar|al|au|by|re|ve|id|length|hash|sign|qq|total|offset|kana|language)\s*:[^\]]*\]\s*$", re.I)
+_ID_TAG = re.compile(r"^\s*\[(?:ti|ar|al|au|by|re|ve|id|length|hash|sign|qq|total|kana|language)\s*:[^\]]*\]\s*$", re.I)
 _TS = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
 _CREDIT = re.compile(
     r"^\s*(?:作词|作曲|编曲|制作人|词|曲|编|混音|母带|录音|和声|吉他|贝斯|鼓|键盘|弦乐|监制|出品|发行|"

@@ -1128,7 +1128,10 @@ class LrcSyncApp(QMainWindow):
         import lyrics_fetch
         info = lyrics_fetch.read_track_info(self.current_file_path)
         duration = info.duration_s or (self.duration_ms / 1000 if self.duration_ms > 1 else None)
-        dialog = LyricsPickerDialog(info.artist, lyrics_fetch.clean_title(info.title), duration, self)
+        dialog = LyricsPickerDialog(
+            info.artist, lyrics_fetch.clean_title(info.title), duration, self,
+            use_ytmusic=_as_bool(self.settings.value("lyrics_ytmusic", False), False),
+        )
         QTimer.singleShot(0, dialog.run_search)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.chosen_text:
             self._on_search_result(dialog.chosen_text)
@@ -1222,7 +1225,8 @@ class LrcSyncApp(QMainWindow):
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         embed = _as_bool(self.settings.value("embed_lyrics", False), False)
-        self._downloader = LyricsDownloaderThread(file_paths, embed)
+        use_ytmusic = _as_bool(self.settings.value("lyrics_ytmusic", False), False)
+        self._downloader = LyricsDownloaderThread(file_paths, embed, use_ytmusic=use_ytmusic)
         self._downloader.progress.connect(self._on_download_progress)
         if hasattr(self._downloader, "file_done"):
             self._downloader.file_done.connect(self._on_lyrics_file_done)

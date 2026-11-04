@@ -50,11 +50,13 @@ def stop_thread(thread: QThread | None, timeout_ms: int = 2000) -> None:
 
 
 class LyricsDownloaderThread(QThread):
-    """Fetch lyrics for a batch of audio files and write ``.lrc`` sidecars.
+    """Find lyrics for several songs and write their ``.lrc`` sidecars.
 
-    Uses ``lyrics_fetch.fetch_best_lyrics`` (duration-aware LRCLIB first,
-    other providers after, plain text only as a last resort). Optionally
-    embeds the same text into the audio file's tags.
+    Uses ``lyrics_fetch.fetch_best_lyrics`` (LRCLIB cross-checked against
+    other sources; plain text only as a last resort). It never replaces
+    synced lyrics, including ones saved while the batch was running (the
+    file is checked again right before writing), and only replaces plain
+    lyrics with synced ones. Optionally embeds the text in the tags too.
 
     Signals
     -------
@@ -69,10 +71,11 @@ class LyricsDownloaderThread(QThread):
     file_done      = pyqtSignal(str, str)         # (path, "synced" | "plain" | "none")
     finished_batch = pyqtSignal(list, list)       # (success, failed)
 
-    def __init__(self, files: list[str], embed: bool = False) -> None:
+    def __init__(self, files: list[str], embed: bool = False, use_ytmusic: bool = False) -> None:
         super().__init__()
         self.files = files
         self.embed = embed
+        self.use_ytmusic = use_ytmusic
         self._cancel_event = threading.Event()
 
     def request_cancel(self) -> None:
@@ -80,7 +83,7 @@ class LyricsDownloaderThread(QThread):
 
     def run(self) -> None:
         import lyrics_fetch
-        from utils import write_embedded_lyrics
+        from utils import lrc_status_key, write_embedded_lyrics
 
         success: list[str] = []
         failed:  list[str] = []
@@ -90,15 +93,23 @@ class LyricsDownloaderThread(QThread):
             if self._cancel_event.is_set():
                 break
             filename = os.path.basename(file_path)
+            lrc_path = os.path.splitext(file_path)[0] + ".lrc"
+            if lrc_status_key(lrc_path) == "synced":
+                continue          # nothing to improve, and never overwrite it
             self.progress.emit(f"Lyrics: {filename}", idx, total)
             kind = "none"
             try:
                 info = lyrics_fetch.read_track_info(file_path)
-                result = lyrics_fetch.fetch_best_lyrics(info)
+                result = lyrics_fetch.fetch_best_lyrics(info, use_ytmusic=self.use_ytmusic)
                 if result and result.text.strip():
-                    lrc_path = os.path.splitext(file_path)[0] + ".lrc"
-                    with open(lrc_path, "w", encoding="utf-8") as fh:
+                    # Check again: the user may have saved lyrics meanwhile.
+                    now = lrc_status_key(lrc_path)
+                    if now == "synced" or (now == "plain" and not result.synced):
+                        continue
+                    tmp = lrc_path + ".part"
+                    with open(tmp, "w", encoding="utf-8") as fh:
                         fh.write(result.text)
+                    os.replace(tmp, lrc_path)
                     kind = "synced" if result.synced else "plain"
                     if self.embed:
                         try:
@@ -120,38 +131,21 @@ class LyricsCandidatesThread(QThread):
     results_ready = pyqtSignal(list)   # list[lyrics_fetch.LyricsCandidate]
     failed        = pyqtSignal(str)
 
-    def __init__(self, artist: str, title: str, duration_s: float | None) -> None:
+    def __init__(self, artist: str, title: str, duration_s: float | None, use_ytmusic: bool = False) -> None:
         super().__init__()
         self._artist = artist
         self._title = title
         self._duration_s = duration_s
+        self._use_ytmusic = use_ytmusic
 
     def run(self) -> None:
         import lyrics_fetch
         try:
-            self.results_ready.emit(
-                lyrics_fetch.search_candidates(self._artist, self._title, self._duration_s)
-            )
+            self.results_ready.emit(lyrics_fetch.search_candidates(
+                self._artist, self._title, self._duration_s, use_ytmusic=self._use_ytmusic,
+            ))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
-
-
-class LyricsSearchThread(QThread):
-    """One-shot free-text lyrics search across syncedlyrics' providers —
-    the fallback inside the manual picker when LRCLIB has nothing."""
-
-    result_ready = pyqtSignal(str)
-
-    def __init__(self, query: str) -> None:
-        super().__init__()
-        self._query = query
-
-    def run(self) -> None:
-        try:
-            result = syncedlyrics.search(self._query)
-            self.result_ready.emit(result or "")
-        except Exception:
-            self.result_ready.emit("")
 
 
 def wait_for_download(
