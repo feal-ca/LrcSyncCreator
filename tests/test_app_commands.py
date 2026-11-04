@@ -175,39 +175,19 @@ class _Sig:
 
 
 def test_find_music_routes_plain_text_to_soulseek_search(window, monkeypatch):
-    # Plain or malformed text must fall through to a direct Soulseek
-    # search, not silently do nothing.
-    import search_view
+    class _Client:
+        def __init__(self):
+            self.queries = []
 
-    class _FakeSearchThread:
-        instances = []
+        def start_search(self, query, on_results=None, **_kw):
+            self.queries.append(query)
+            return 1
 
-        def __init__(self, client, query, wait_s=25.0) -> None:
-            self.client = client
-            self.query = query
-            self.started = False
-            self.progress = _Sig()
-            self.results_ready = _Sig()
-            self.search_failed = _Sig()
-            self.finished = _Sig()
-            _FakeSearchThread.instances.append(self)
+        def stop_search(self, _sid):
+            return []
 
-        def start(self) -> None:
-            self.started = True
-
-        def isRunning(self) -> bool:
-            return False
-
-        def request_stop(self) -> None:
-            pass
-
-        request_cancel = request_stop
-
-        def wait(self, *_a) -> bool:
-            return True
-
-    monkeypatch.setattr(search_view, "SoulseekLiveSearchThread", _FakeSearchThread)
-    monkeypatch.setattr(window, "_get_slsk_client", lambda: object())
+    client = _Client()
+    monkeypatch.setattr(window, "_get_slsk_client", lambda: client)
     batch_import_calls = []
     monkeypatch.setattr(window, "_open_batch_import", lambda link: batch_import_calls.append(link))
 
@@ -216,10 +196,7 @@ def test_find_music_routes_plain_text_to_soulseek_search(window, monkeypatch):
     window.search_view.search_button.click()
 
     assert batch_import_calls == []  # never mistaken for a Spotify link
-    assert len(_FakeSearchThread.instances) == 1
-    thread = _FakeSearchThread.instances[0]
-    assert thread.query == "Bohemian Rhapsody Queen"
-    assert thread.started is True
+    assert client.queries == ["Bohemian Rhapsody Queen"]
     assert window.search_view._history()[0] == "Bohemian Rhapsody Queen"
 
 

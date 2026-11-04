@@ -1,33 +1,38 @@
-"""search_view.py — Soulseek search, Nicotine+-style.
+"""search_view.py — the Search page: Soulseek search, Nicotine+-style but
+with less to sort through.
 
-Search for a title (or an artist, or an album), then narrow the results
-by typing in the filter box: it matches the whole remote path plus the
-uploader, so "title, then filter by artist" (or the reverse) is two
-quick steps. Results sort by any column; double-click or Enter queues a
-download; "Download folder" grabs a whole album from that peer.
+Type an artist and title and press Enter. Results stream in as peers
+answer, grouped into song versions (one row each, the individual copies
+underneath) and ranked so the version you most likely want is on top and
+already selected. Enter downloads its best copy, with the other copies as
+automatic fallbacks; Shift+Enter downloads the whole album from that peer.
+Each row then shows its download, and versions you already have say
+"In library".
 
-``SearchResultsWidget`` (filter bar + table) is shared with the Spotify
-review's "Change match" dialog.
+``SearchResultsWidget`` (filter bar + flat table) is the Spotify review's
+"Change match" picker.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Callable
 
 from PyQt6.QtCore import (
-    QAbstractTableModel, QModelIndex, QSettings, QSortFilterProxyModel, Qt,
+    QAbstractTableModel, QModelIndex, QObject, QSettings, QSortFilterProxyModel, Qt,
     QTimer, pyqtSignal,
 )
 from PyQt6.QtGui import QAction, QColor, QGuiApplication, QKeySequence
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QCompleter, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMenu, QProgressBar, QPushButton,
-    QStackedWidget, QTableView, QVBoxLayout, QWidget,
+    QStackedWidget, QTableView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 import theme
+from search_groups import SongVersion, VersionIndex, owned_stems
 from soulseek import ResultFilter, SoulseekClient, SoulseekFile
-from workers import FolderBrowseThread, SoulseekLiveSearchThread
+from workers import FolderBrowseThread
 
 HISTORY_KEY = "search_history"
 HISTORY_LIMIT = 30
@@ -314,16 +319,39 @@ class SearchResultsWidget(QWidget):
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
 
+# How long a search keeps listening for late peers. Most answer within
+# seconds; stopping frees the network and memory.
+SEARCH_SECONDS = 60
+# Re-rank at most this often while results pour in.
+REFRESH_MS = 1000
+
+S_SONG, S_ALBUM, S_LENGTH, S_QUALITY, S_COPIES, S_STATUS = range(6)
+_S_HEADERS = ["Song", "Album", "Length", "Quality", "Copies", "Status"]
+_VERSION_ROLE = Qt.ItemDataRole.UserRole
+_COPY_ROLE = Qt.ItemDataRole.UserRole + 1
+
+_PHASE_STATUS = {
+    "requesting": "Starting…",
+    "processing": "Finishing…",
+}
+
+
+class _ResultsBridge(QObject):
+    """Carries result batches from the Soulseek loop thread to the GUI."""
+
+    results = pyqtSignal(int, list)   # (search sequence number, files)
+
+
 class SearchView(QWidget):
     """The Search page of the workspace.
 
     Signals
     -------
     download_requested(files)
-        Queue these files (TransfersView does the rest).
+        Queue these files (TransfersView does the rest; alternatives_for()
+        supplies the fallbacks).
     spotify_link_entered(link)
-        The query was a Spotify link; the main window routes it to the
-        playlist review page instead of searching Soulseek for it.
+        The query was a Spotify link; the main window opens its review.
     """
 
     download_requested = pyqtSignal(list)
@@ -335,15 +363,31 @@ class SearchView(QWidget):
         get_client: Callable[[], SoulseekClient | None],
         is_spotify_link: Callable[[str], bool],
         parent: QWidget | None = None,
+        library_paths: Callable[[], list[str]] | None = None,
     ) -> None:
         super().__init__(parent)
         self._settings = settings
         self._get_client = get_client
         self._is_spotify_link = is_spotify_link
+        self._library_paths = library_paths or (lambda: [])
         self._search_seq = 0
-        self._active_search: SoulseekLiveSearchThread | None = None
+        self._client = None
+        self._search_id: int | None = None
+        self._query = ""
+        self._index = VersionIndex("")
+        self._status_by_version: dict[int, str] = {}
+        self._version_by_item: dict[int, int] = {}      # transfer item id -> version id
+        self._user_picked = False
+        self._dirty = False
         self._threads: set = set()     # keep QThread refs alive until they finish
-        self._elapsed = 0
+        self._bridge = _ResultsBridge(self)
+        self._bridge.results.connect(self._on_results)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(REFRESH_MS)
+        self._refresh_timer.timeout.connect(self._refresh_if_dirty)
+        self._stop_timer = QTimer(self)
+        self._stop_timer.setSingleShot(True)
+        self._stop_timer.timeout.connect(self.stop_search)
         self._build_ui()
 
     # -- UI -----------------------------------------------------------------
@@ -357,7 +401,7 @@ class SearchView(QWidget):
         row.setSpacing(8)
         self.query_input = QLineEdit()
         self.query_input.setProperty("variant", "search")
-        self.query_input.setPlaceholderText("Search Soulseek for a song, artist or album, or paste a Spotify link")
+        self.query_input.setPlaceholderText("Artist and title, or a Spotify link")
         self.query_input.setClearButtonEnabled(True)
         self.query_input.returnPressed.connect(self.run_search)
         self._completer = QCompleter(self._history(), self)
@@ -365,27 +409,26 @@ class SearchView(QWidget):
         self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self.query_input.setCompleter(self._completer)
         row.addWidget(self.query_input, stretch=1)
-
         self.search_button = QPushButton("Search")
         self.search_button.setProperty("variant", "primary")
         self.search_button.clicked.connect(self.run_search)
         row.addWidget(self.search_button)
-
-        self.stop_button = QPushButton("Show results now")
-        self.stop_button.setToolTip("Stop waiting for more peers and show what has arrived")
-        self.stop_button.clicked.connect(self.stop_search)
-        self.stop_button.setVisible(False)
-        row.addWidget(self.stop_button)
         layout.addLayout(row)
 
-        status_row = QHBoxLayout()
+        filters = QHBoxLayout()
+        filters.setSpacing(8)
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("Filter the results (-word hides)")
+        self.filter_input.setClearButtonEnabled(True)
+        self.filter_input.textChanged.connect(lambda _t: self._mark_dirty(soon=True))
+        filters.addWidget(self.filter_input, stretch=1)
+        self.lossless_check = QCheckBox("Lossless only")
+        self.lossless_check.toggled.connect(lambda _c: self._mark_dirty(soon=True))
+        filters.addWidget(self.lossless_check)
         self.status_label = QLabel("")
         self.status_label.setProperty("role", "muted")
-        status_row.addWidget(self.status_label, stretch=1)
-        self.count_label = QLabel("")
-        self.count_label.setProperty("role", "muted")
-        status_row.addWidget(self.count_label)
-        layout.addLayout(status_row)
+        filters.addWidget(self.status_label)
+        layout.addLayout(filters)
 
         self.busy_bar = QProgressBar()
         self.busy_bar.setRange(0, 0)
@@ -395,34 +438,56 @@ class SearchView(QWidget):
 
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_intro())                 # 0
-        self.results = SearchResultsWidget()
-        self.results.activated.connect(self.download_requested.emit)
-        self.results.folder_requested.connect(self.download_folder)
-        self.results.selection_changed.connect(self._on_selection_changed)
-        self.results.proxy.layoutChanged.connect(self._update_counts)
-        self.results.proxy.modelReset.connect(self._update_counts)
-        self.results.proxy.rowsInserted.connect(self._update_counts)
-        self.results.proxy.rowsRemoved.connect(self._update_counts)
-        self.stack.addWidget(self.results)                         # 1
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(len(_S_HEADERS))
+        self.tree.setHeaderLabels(_S_HEADERS)
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAllColumnsShowFocus(True)
+        self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.tree.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tree.setTextElideMode(Qt.TextElideMode.ElideRight)
+        header = self.tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(S_SONG, QHeaderView.ResizeMode.Stretch)
+        for col, width in ((S_ALBUM, 200), (S_LENGTH, 60), (S_QUALITY, 86), (S_COPIES, 64), (S_STATUS, 170)):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            header.resizeSection(col, width)
+        self.tree.itemExpanded.connect(self._fill_copies)
+        self.tree.itemActivated.connect(lambda _item, _col: self.download_selected())
+        self.tree.itemPressed.connect(lambda *_a: self.on_user_picked())
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
+        for keys, handler in (
+            ("Shift+Return", self.download_selected_album),
+            ("Shift+Enter", self.download_selected_album),
+        ):
+            action = QAction(self.tree)
+            action.setShortcut(QKeySequence(keys))
+            action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+            action.triggered.connect(handler)
+            self.tree.addAction(action)
+        self.tree.installEventFilter(self)
+        self.stack.addWidget(self.tree)                            # 1
         layout.addWidget(self.stack, stretch=1)
 
         actions = QHBoxLayout()
         self.download_button = QPushButton("Download")
         self.download_button.setProperty("variant", "primary")
         self.download_button.setEnabled(False)
-        self.download_button.clicked.connect(lambda: self.results._emit_activated())
-        self.folder_button = QPushButton("Download folder")
-        self.folder_button.setToolTip("Every audio file in the selected result's folder on that peer (the whole album)")
-        self.folder_button.setEnabled(False)
-        self.folder_button.clicked.connect(self._download_selected_folder)
-        hint = QLabel("Double-click or Enter to download. Right-click for more.")
+        self.download_button.clicked.connect(self.download_selected)
+        self.album_button = QPushButton("Download album")
+        self.album_button.setEnabled(False)
+        self.album_button.clicked.connect(self.download_selected_album)
+        hint = QLabel("Enter downloads the best copy, Shift+Enter the whole album. Other copies are used if one fails.")
         hint.setProperty("role", "faint")
         actions.addWidget(self.download_button)
-        actions.addWidget(self.folder_button)
+        actions.addWidget(self.album_button)
         actions.addSpacing(8)
         actions.addWidget(hint)
         actions.addStretch(1)
         layout.addLayout(actions)
+        self.tree.currentItemChanged.connect(lambda *_a: self._update_buttons())
 
     def _build_intro(self) -> QWidget:
         page = QWidget()
@@ -432,9 +497,9 @@ class SearchView(QWidget):
         title.setProperty("role", "title")
         v.addWidget(title, alignment=Qt.AlignmentFlag.AlignHCenter)
         body = QLabel(
-            "Search by title, then type the artist in the filter box to keep the\n"
-            "right copies (or search the artist and filter by title).\n"
-            "Paste a Spotify track, album or playlist link to import all of it."
+            "Type the artist and the title, then press Enter.\n"
+            "Results appear as people answer, the best copy on top.\n"
+            "Paste a Spotify link to import a whole album or playlist."
         )
         body.setProperty("role", "muted")
         body.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -442,6 +507,13 @@ class SearchView(QWidget):
         v.addWidget(body, alignment=Qt.AlignmentFlag.AlignHCenter)
         v.addStretch(3)
         return page
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 — Qt override
+        # Any key or click in the results means the user is choosing: stop
+        # reshuffling rows under them.
+        if obj is self.tree and event.type() in (event.Type.KeyPress, event.Type.MouseButtonPress):
+            self.on_user_picked()
+        return super().eventFilter(obj, event)
 
     def focus_query(self) -> None:
         self.query_input.setFocus()
@@ -478,113 +550,291 @@ class SearchView(QWidget):
         client = self._get_client()
         if client is None:
             return
-
         self._remember(query)
-        self.stop_search(silent=True)
+        self.stop_search()
         self._search_seq += 1
         seq = self._search_seq
-
-        thread = SoulseekLiveSearchThread(client, query)
-        thread.progress.connect(lambda peers, files, s=seq: self._on_progress(s, peers, files))
-        thread.results_ready.connect(lambda results, s=seq: self._on_results(s, results))
-        thread.search_failed.connect(lambda msg, s=seq: self._on_failed(s, msg))
-        self._track(thread)
-        self._active_search = thread
-
-        self._elapsed = 0
-        self.results.set_results([])
+        self._client = client
+        self._query = query
+        self._index = VersionIndex(query, owned=owned_stems(self._library_paths()))
+        self._status_by_version = {}
+        self._version_by_item = {}
+        self._user_picked = False
+        self.tree.clear()
         self.stack.setCurrentIndex(1)
-        self.status_label.setText(f"Searching for “{query}”…")
-        self.count_label.setText("")
-        self.busy_bar.setVisible(True)
-        self.stop_button.setVisible(True)
-        thread.start()
-
-    def stop_search(self, silent: bool = False) -> None:
-        if self._active_search is not None and self._active_search.isRunning():
-            self._active_search.request_stop()
-            if not silent:
-                self.status_label.setText("Collecting results…")
-        self.stop_button.setVisible(False)
-
-    def _track(self, thread) -> None:
-        self._threads.add(thread)
-        thread.finished.connect(lambda t=thread: self._threads.discard(t))
-
-    def _on_progress(self, seq: int, peers: int, files: int) -> None:
-        if seq != self._search_seq or self._active_search is None:
-            return
-        self.status_label.setText(
-            f"Searching for “{self._active_search.query}”: {peers} peers have answered with {files} files so far"
-        )
-
-    def _on_results(self, seq: int, results: list) -> None:
-        if seq != self._search_seq:
-            return
-        self.busy_bar.setVisible(False)
-        self.stop_button.setVisible(False)
-        query = self._active_search.query if self._active_search else ""
-        self._active_search = None
-        self.results.set_results(results)
-        peers = len({f.username for f in results})
-        if results:
-            self.status_label.setText(f"{len(results)} audio files from {peers} peers for “{query}”")
-            self.results.filter_input.setFocus()
-        else:
-            self.status_label.setText(
-                f"No audio files for “{query}”. Try fewer words, or just the title."
+        try:
+            self._search_id = client.start_search(
+                query, on_results=lambda files, s=seq: self._bridge.results.emit(s, files),
             )
-        self._update_counts()
-
-    def _on_failed(self, seq: int, message: str) -> None:
-        if seq != self._search_seq:
+        except Exception as exc:  # noqa: BLE001 — shown, never fatal
+            self.status_label.setText(f"Search failed: {exc}")
             return
+        self.status_label.setText("Searching…")
+        self.busy_bar.setVisible(True)
+        self._refresh_timer.start()
+        self._stop_timer.start(SEARCH_SECONDS * 1000)
+
+    def stop_search(self) -> None:
+        """Stop listening for more results (they stay on screen)."""
+        self._stop_timer.stop()
+        if self._client is not None and self._search_id is not None:
+            try:
+                self._client.stop_search(self._search_id)
+            except Exception:  # noqa: BLE001 — the connection may already be gone
+                pass
+        self._search_id = None
         self.busy_bar.setVisible(False)
-        self.stop_button.setVisible(False)
-        self._active_search = None
-        self.status_label.setText(f"Search failed: {message}")
+        self._refresh_if_dirty()
+        self._refresh_timer.stop()
+        self._update_status_line(searching=False)
 
-    def _update_counts(self, *_args) -> None:
-        total = self.results.total_count()
-        shown = self.results.visible_count()
-        if total and shown != total:
-            self.count_label.setText(f"Showing {shown} of {total}")
+    def _on_results(self, seq: int, files: list) -> None:
+        if seq != self._search_seq or self._search_id is None:
+            return
+        first = self._index.file_count == 0
+        self._index.add(files)
+        self._mark_dirty(soon=first)
+
+    def _mark_dirty(self, soon: bool = False) -> None:
+        self._dirty = True
+        if soon:
+            QTimer.singleShot(0, self._refresh_if_dirty)
+
+    def _refresh_if_dirty(self) -> None:
+        if self._dirty:
+            self.refresh_now()
+
+    def refresh_now(self) -> None:
+        """Redraw the ranked versions, keeping the selection, the expanded
+        rows and the scroll position."""
+        self._dirty = False
+        self._index.set_filter(self.filter_input.text(), self.lossless_check.isChecked())
+        current = self.tree.currentItem()
+        keep_id = None
+        if current is not None:
+            top = current if current.parent() is None else current.parent()
+            keep_id = top.data(0, _VERSION_ROLE)
+        expanded = {
+            self.tree.topLevelItem(i).data(0, _VERSION_ROLE)
+            for i in range(self.tree.topLevelItemCount())
+            if self.tree.topLevelItem(i).isExpanded()
+        }
+        scroll = self.tree.verticalScrollBar().value()
+        self.tree.setUpdatesEnabled(False)
+        try:
+            self.tree.clear()
+            select = None
+            for version in self._index.ranked():
+                item = self._version_item(version)
+                self.tree.addTopLevelItem(item)
+                if version.id in expanded:
+                    item.setExpanded(True)
+                if version.id == keep_id:
+                    select = item
+            if select is None and self.tree.topLevelItemCount() and not self._user_picked:
+                select = self.tree.topLevelItem(0)
+            if select is not None:
+                self.tree.setCurrentItem(select)
+            self.tree.verticalScrollBar().setValue(scroll)
+        finally:
+            self.tree.setUpdatesEnabled(True)
+        self._update_status_line(searching=self._search_id is not None)
+        self._update_buttons()
+
+    def _version_item(self, version: SongVersion) -> QTreeWidgetItem:
+        copies = self._index.visible_copies(version)
+        best = copies[0]
+        item = QTreeWidgetItem([
+            version.title,
+            best.folder_name,
+            _fmt_length(version.length_s),
+            best.format_label,
+            str(len(copies)),
+            self._status_text(version),
+        ])
+        item.setData(0, _VERSION_ROLE, version.id)
+        item.setToolTip(S_SONG, best.filename.replace("\\", "/"))
+        item.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
+        for col in (S_LENGTH, S_COPIES):
+            item.setTextAlignment(col, int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter))
+        muted = QColor(theme.TEXT_3)
+        if version.unwanted or best.quality_ok is False:
+            for col in range(len(_S_HEADERS)):
+                item.setForeground(col, muted)
         else:
-            self.count_label.setText("")
+            item.setForeground(S_ALBUM, QColor(theme.TEXT_2))
+        status = self._status_text(version)
+        if status == "In library":
+            item.setForeground(S_STATUS, QColor(theme.OK))
+        elif status.startswith("Failed"):
+            item.setForeground(S_STATUS, QColor(theme.DANGER))
+        return item
 
-    def _on_selection_changed(self, n: int) -> None:
-        self.download_button.setEnabled(n > 0)
-        self.download_button.setText(f"Download {n} files" if n > 1 else "Download")
-        self.folder_button.setEnabled(n > 0)
+    def _fill_copies(self, item: QTreeWidgetItem) -> None:
+        if item.parent() is not None or item.childCount():
+            return
+        version = self._version_by_id(item.data(0, _VERSION_ROLE))
+        if version is None:
+            return
+        for f in self._index.visible_copies(version):
+            child = QTreeWidgetItem([
+                f.username, f.folder_name, _fmt_length(f.length_s), f.format_label,
+                "free" if f.has_free_slot else f"queue {f.queue_length}",
+                _fmt_speed(f.upload_speed),
+            ])
+            child.setData(0, _COPY_ROLE, (f.username, f.filename))
+            child.setToolTip(S_SONG, f.filename.replace("\\", "/"))
+            for col in range(len(_S_HEADERS)):
+                child.setForeground(col, QColor(theme.TEXT_2))
+            item.addChild(child)
+
+    def _version_by_id(self, version_id) -> SongVersion | None:
+        return next((v for v in self._index.ranked() if v.id == version_id), None)
+
+    def _update_status_line(self, searching: bool) -> None:
+        files, peers = self._index.file_count, self._index.peer_count
+        if searching:
+            text = f"Searching… {peers} people, {files} files" if files else "Searching…"
+        elif files:
+            text = f"{files} files from {peers} people"
+        elif self._query:
+            text = "Nothing found. Try fewer words, or just the title."
+        else:
+            text = ""
+        self.status_label.setText(text)
+
+    def on_user_picked(self) -> None:
+        if not self._user_picked:
+            self._user_picked = True
+            self._index.freeze_order()
+
+    def _update_buttons(self) -> None:
+        has = self.tree.currentItem() is not None
+        self.download_button.setEnabled(has)
+        self.album_button.setEnabled(has)
+
+    # -- selection → files ------------------------------------------------------
+
+    def _selected(self) -> tuple[SongVersion | None, SoulseekFile | None]:
+        """The selected version, and the copy to get: the one picked by hand
+        (a child row) or the version's best."""
+        item = self.tree.currentItem()
+        if item is None:
+            return None, None
+        top = item if item.parent() is None else item.parent()
+        version = self._version_by_id(top.data(0, _VERSION_ROLE))
+        if version is None:
+            return None, None
+        key = item.data(0, _COPY_ROLE)
+        if key:
+            chosen = next((f for f in version.copies if (f.username, f.filename) == tuple(key)), None)
+            if chosen is not None:
+                return version, chosen
+        copies = self._index.visible_copies(version)
+        return version, (copies[0] if copies else None)
+
+    def download_selected(self) -> None:
+        _version, chosen = self._selected()
+        if chosen is not None:
+            self.download_requested.emit([chosen])
+
+    def download_selected_album(self) -> None:
+        _version, chosen = self._selected()
+        if chosen is not None:
+            self.download_folder(chosen)
 
     def alternatives_for(self, f: SoulseekFile) -> list[SoulseekFile]:
-        """Other peers' copies of *f* in the current results (same file
-        name, size within 15%), best first — fallbacks if its peer never
-        answers or rejects the request."""
-        from soulseek import availability_key, normalize_text
+        """Other peers' copies of the same version, best first."""
+        return self._index.alternatives(f)
 
-        stem = normalize_text(f.display_name.rsplit(".", 1)[0])
-        same = [
-            o for o in self.results.model.files
-            if o is not f and o.username != f.username
-            and normalize_text(o.display_name.rsplit(".", 1)[0]) == stem
-            and f.size and abs(o.size - f.size) <= 0.15 * f.size
-        ]
-        return sorted(same, key=availability_key)
+    # -- download status on the rows ----------------------------------------------
+
+    def note_queued(self, files: list[SoulseekFile], item_ids: list[int]) -> None:
+        for f, item_id in zip(files, item_ids):
+            version = self._index.version_of(f) if f is not None else None
+            if version is not None:
+                self._version_by_item[item_id] = version.id
+                self._set_version_status(version.id, "Starting…")
+
+    def on_transfer_status(self, item_id: int, phase: str, percent: int, text: str) -> None:
+        version_id = self._version_by_item.get(item_id)
+        if version_id is None:
+            return
+        if phase == "downloading":
+            status = f"Downloading {percent}%"
+        elif phase == "queued":
+            place = re.search(r"\(#(\d+)\)", text or "")
+            status = f"Queued by uploader (#{place.group(1)})" if place else "Queued by uploader"
+        else:
+            status = _PHASE_STATUS.get(phase, text or "Starting…")
+        self._set_version_status(version_id, status)
+
+    def on_transfer_finished(self, item_id: int, ok: bool, detail: str, path: str) -> None:
+        version_id = self._version_by_item.pop(item_id, None)
+        if version_id is None:
+            return
+        if ok:
+            status = "In library"
+        elif detail == "Cancelled.":
+            status = "Cancelled"
+        else:
+            status = "Failed"
+        self._set_version_status(version_id, status)
+
+    def _set_version_status(self, version_id: int, status: str) -> None:
+        self._status_by_version[version_id] = status
+        for i in range(self.tree.topLevelItemCount()):
+            item = self.tree.topLevelItem(i)
+            if item.data(0, _VERSION_ROLE) == version_id:
+                item.setText(S_STATUS, status)
+                color = theme.OK if status == "In library" else theme.DANGER if status == "Failed" else theme.TEXT
+                item.setForeground(S_STATUS, QColor(color))
+                break
+
+    def _status_text(self, version: SongVersion) -> str:
+        if version.id in self._status_by_version:
+            return self._status_by_version[version.id]
+        return "In library" if version.in_library else ""
+
+    # -- right-click -------------------------------------------------------------
+
+    def _show_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        self.tree.setCurrentItem(item)
+        self.on_user_picked()
+        version, chosen = self._selected()
+        if chosen is None:
+            return
+        menu = QMenu(self)
+        is_copy = item.parent() is not None
+        download = menu.addAction("Download This Copy" if is_copy else "Download", self.download_selected)
+        download.setShortcut(QKeySequence("Return"))
+        album = menu.addAction(
+            f"Download Album “{chosen.folder_name or '/'}” from {chosen.username}", self.download_selected_album,
+        )
+        album.setShortcut(QKeySequence("Shift+Return"))
+        menu.addSeparator()
+        if not is_copy:
+            top = item
+            menu.addAction("Hide Copies" if top.isExpanded() else f"Show the {len(version.copies)} Copies",
+                           lambda: top.setExpanded(not top.isExpanded()))
+        menu.addAction(f"Show Only Files from {chosen.username}",
+                       lambda: self.filter_input.setText(f'"{chosen.username}"'))
+        menu.addAction("Copy Remote Path", lambda: QGuiApplication.clipboard().setText(chosen.filename))
+        for action in menu.actions():
+            action.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        menu.exec(self.tree.viewport().mapToGlobal(pos))
 
     # -- folders --------------------------------------------------------------
-
-    def _download_selected_folder(self) -> None:
-        files = self.results.selected_files()
-        if files:
-            self.download_folder(files[0])
 
     def download_folder(self, like: SoulseekFile) -> None:
         client = self._get_client()
         if client is None:
             return
         siblings = [
-            f for f in self.results.model.files
+            f for v in self._index.ranked() for f in v.copies
             if f.username == like.username and f.folder == like.folder
         ]
         self.status_label.setText(f"Listing “{like.folder_name}” on {like.username}…")
@@ -597,7 +847,7 @@ class SearchView(QWidget):
 
         def on_fail(message: str) -> None:
             self.status_label.setText(
-                f"Couldn't list the whole folder ({message}). Queued the {len(siblings)} "
+                f"Couldn't list the whole album ({message}). Queued the {len(siblings)} "
                 "files from it that were in the results."
             )
             if siblings:
@@ -608,7 +858,19 @@ class SearchView(QWidget):
         self._track(thread)
         thread.start()
 
+    def _track(self, thread) -> None:
+        self._threads.add(thread)
+        thread.finished.connect(lambda t=thread: self._threads.discard(t))
+
     def shutdown(self) -> None:
         from workers import stop_thread
+        self._refresh_timer.stop()
+        self._stop_timer.stop()
+        if self._client is not None and self._search_id is not None:
+            try:
+                self._client.stop_search(self._search_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self._search_id = None
         for thread in list(self._threads):
             stop_thread(thread)

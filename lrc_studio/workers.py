@@ -337,39 +337,6 @@ class SoulseekSearchThread(QThread):
             self.search_failed.emit(str(exc))
 
 
-class SoulseekLiveSearchThread(QThread):
-    """A Soulseek search that reports slskd's live peer/file counters while
-    it runs and can be told to stop early and deliver what it has."""
-
-    progress      = pyqtSignal(int, int)   # (peers, files) so far
-    results_ready = pyqtSignal(list)       # list[SoulseekFile]
-    search_failed = pyqtSignal(str)
-
-    def __init__(self, client: SoulseekClient, query: str, wait_s: float = 25.0) -> None:
-        super().__init__()
-        self._client = client
-        self.query = query
-        self._wait_s = wait_s
-        self._stop_event = threading.Event()
-
-    def request_stop(self) -> None:
-        self._stop_event.set()
-
-    request_cancel = request_stop   # what stop_thread() looks for
-
-    def run(self) -> None:
-        try:
-            results = self._client.search(
-                self.query, wait_s=self._wait_s,
-                on_progress=self.progress.emit, stop_event=self._stop_event,
-            )
-            self.results_ready.emit(results)
-        except SlskdError as exc:
-            self.search_failed.emit(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            self.search_failed.emit(f"Unexpected error: {exc}")
-
-
 class FolderBrowseThread(QThread):
     """List every audio file in a peer's folder (for "Download folder")."""
 

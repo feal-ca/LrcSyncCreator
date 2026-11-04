@@ -378,7 +378,10 @@ class LrcSyncApp(QMainWindow):
         # override) replacing these on the instance is honoured.
         self.search_view = SearchView(
             self.settings, lambda: self._get_slsk_client(), is_spotify_link, self,
+            library_paths=lambda: self.library_panel.real_file_paths(),
         )
+        self.transfers_view.item_changed.connect(self.search_view.on_transfer_status)
+        self.transfers_view.item_finished.connect(self.search_view.on_transfer_finished)
         self.search_view.spotify_link_entered.connect(lambda link: self._open_batch_import(link))
         self.search_view.download_requested.connect(self._queue_downloads)
         self.workspace.addWidget(self.search_view)                  # WORKSPACE_SEARCH = 3
@@ -1531,7 +1534,10 @@ class LrcSyncApp(QMainWindow):
         # takes, unless other peers have the same file: then after four
         # minutes it moves on to the next copy.
         alternatives = getattr(self.search_view, "alternatives_for", None)
-        added = len(self.transfers_view.enqueue(files, alternatives=alternatives, queue_patience_s=240))
+        ids = self.transfers_view.enqueue(files, alternatives=alternatives, queue_patience_s=240)
+        # enqueue skips files already queued, so ask it which file each id is.
+        self.search_view.note_queued([self.transfers_view.file_of(i) for i in ids], ids)
+        added = len(ids)
         if added:
             self.status_bar.setText(
                 f"Queued {added} download{'s' if added != 1 else ''}. Follow them in Downloads (Ctrl+J)."

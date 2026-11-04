@@ -228,3 +228,13 @@ def test_item_signals_carry_status_and_result(transfers):
 
     assert (ids[0], "downloading", 40, "40% · 1.0 MB/s") in changed
     assert finished == [(ids[0], True, "x.mp3", "/lib/x.mp3")]
+
+
+def test_file_of_maps_item_ids_back_to_files_even_when_some_were_skipped(transfers):
+    a, b = _f("a\\1.mp3"), _f("a\\2.mp3")
+    transfers.enqueue([a])
+
+    ids = transfers.enqueue([a, b])          # a is already queued: only b gets an id
+
+    assert [transfers.file_of(i).filename for i in ids] == [b.filename]
+    assert transfers.file_of(9999) is None

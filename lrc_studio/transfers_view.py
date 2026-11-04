@@ -216,6 +216,10 @@ class TransfersView(QWidget):
             thread.request_skip()
             self._set_phase(item, item.phase, item.percent, "Switching to another source…")
 
+    def file_of(self, item_id: int) -> SoulseekFile | None:
+        item = self._find(item_id)
+        return item.file if item is not None else None
+
     def active_count(self) -> int:
         return sum(1 for i in self._items if i.phase not in _FINISHED)
 
