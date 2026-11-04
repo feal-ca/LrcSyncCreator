@@ -76,3 +76,97 @@ def test_finalize_converts_lossless_and_renames_from_tags(tmp_path):
     assert dest == str(tmp_path / "lib" / "Rosalía - Malamente Cap.1.opus")
     assert not src.exists()
     assert postprocess.tag_based_stem(dest) == "Rosalía - Malamente Cap.1"
+
+
+# -- Standardize names (library right-click "Rename to “Artist - Title”") ----
+
+def _fake_tags(monkeypatch, mapping):
+    """Pretend *mapping* {basename: "Artist - Title"} are the files' tags."""
+    import os
+    monkeypatch.setattr(postprocess, "tag_based_stem",
+                        lambda path: mapping.get(os.path.basename(path)))
+
+
+def test_plan_standard_names_uses_tags(tmp_path, monkeypatch):
+    song = tmp_path / "01 track.mp3"
+    song.write_bytes(b"x")
+    _fake_tags(monkeypatch, {"01 track.mp3": "Manu Chao - Clandestino"})
+
+    [plan] = postprocess.plan_standard_names([str(song)])
+
+    assert plan.old == str(song)
+    assert plan.new == str(tmp_path / "Manu Chao - Clandestino.mp3")
+
+
+def test_plan_skips_files_without_tags(tmp_path, monkeypatch):
+    song = tmp_path / "track07.mp3"
+    song.write_bytes(b"x")
+    _fake_tags(monkeypatch, {})
+
+    [plan] = postprocess.plan_standard_names([str(song)])
+
+    assert plan.new is None
+    assert plan.reason == "No artist/title tags"
+
+
+def test_plan_skips_files_already_named_that_way(tmp_path, monkeypatch):
+    song = tmp_path / "Estopa - Como Camarón.opus"
+    song.write_bytes(b"x")
+    _fake_tags(monkeypatch, {song.name: "Estopa - Como Camarón"})
+
+    [plan] = postprocess.plan_standard_names([str(song)])
+
+    assert plan.new is None
+    assert plan.reason == "Already named that way"
+
+
+def test_plan_skips_second_file_with_the_same_tags(tmp_path, monkeypatch):
+    a, b = tmp_path / "a.mp3", tmp_path / "b.mp3"
+    a.write_bytes(b"a")
+    b.write_bytes(b"b")
+    _fake_tags(monkeypatch, {"a.mp3": "X - Y", "b.mp3": "X - Y"})
+
+    first, second = postprocess.plan_standard_names([str(a), str(b)])
+
+    assert first.new == str(tmp_path / "X - Y.mp3")
+    assert second.new is None
+    assert "already" in second.reason
+
+
+def test_plan_skips_when_target_exists_on_disk(tmp_path, monkeypatch):
+    song = tmp_path / "a.mp3"
+    song.write_bytes(b"a")
+    (tmp_path / "X - Y.mp3").write_bytes(b"other")
+    _fake_tags(monkeypatch, {"a.mp3": "X - Y"})
+
+    [plan] = postprocess.plan_standard_names([str(song)])
+
+    assert plan.new is None
+
+
+def test_apply_renames_moves_audio_and_lrc(tmp_path):
+    song = tmp_path / "a.mp3"
+    song.write_bytes(b"audio")
+    (tmp_path / "a.lrc").write_text("[00:01.00] hi", encoding="utf-8")
+    target = str(tmp_path / "X - Y.mp3")
+
+    done = postprocess.apply_renames([postprocess.RenamePlan(str(song), target, "")])
+
+    assert done == [(str(song), target)]
+    assert (tmp_path / "X - Y.mp3").read_bytes() == b"audio"
+    assert (tmp_path / "X - Y.lrc").read_text(encoding="utf-8") == "[00:01.00] hi"
+    assert not song.exists()
+
+
+def test_apply_renames_never_overwrites(tmp_path):
+    song = tmp_path / "a.mp3"
+    song.write_bytes(b"audio")
+    (tmp_path / "X - Y.mp3").write_bytes(b"keep me")
+
+    done = postprocess.apply_renames(
+        [postprocess.RenamePlan(str(song), str(tmp_path / "X - Y.mp3"), "")]
+    )
+
+    assert done == []
+    assert (tmp_path / "X - Y.mp3").read_bytes() == b"keep me"
+    assert song.exists()

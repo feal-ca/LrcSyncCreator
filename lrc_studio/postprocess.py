@@ -72,6 +72,60 @@ def library_stem(path: str) -> str:
     return clean_filename(strip_track_number(stem)).strip(" .") or stem
 
 
+@dataclass
+class RenamePlan:
+    """One file's standardized name: *new* is None when it stays as it is,
+    and *reason* says why."""
+
+    old: str
+    new: str | None
+    reason: str
+
+
+def plan_standard_names(paths: list[str]) -> list[RenamePlan]:
+    """What "Rename to “Artist - Title”" would do to each of *paths*, in
+    order. Nothing is touched; a name that would collide with a file on
+    disk, or with an earlier plan in the same batch, is left alone."""
+    plans: list[RenamePlan] = []
+    claimed: set[str] = set()
+    for old in paths:
+        stem = tag_based_stem(old)
+        if not stem:
+            plans.append(RenamePlan(old, None, "No artist/title tags"))
+            continue
+        new = os.path.join(os.path.dirname(old), stem + os.path.splitext(old)[1])
+        if new == old:
+            plans.append(RenamePlan(old, None, "Already named that way"))
+        elif new in claimed or os.path.exists(new):
+            plans.append(RenamePlan(old, None, f"“{os.path.basename(new)}” already exists"))
+        else:
+            claimed.add(new)
+            plans.append(RenamePlan(old, new, ""))
+    return plans
+
+
+def apply_renames(plans: list[RenamePlan]) -> list[tuple[str, str]]:
+    """Carry out *plans* (audio file plus its .lrc). Never overwrites;
+    returns the (old, new) pairs that were actually renamed."""
+    done: list[tuple[str, str]] = []
+    for plan in plans:
+        if not plan.new or os.path.exists(plan.new) or not os.path.exists(plan.old):
+            continue
+        try:
+            os.rename(plan.old, plan.new)
+        except OSError:
+            continue
+        old_lrc = os.path.splitext(plan.old)[0] + ".lrc"
+        new_lrc = os.path.splitext(plan.new)[0] + ".lrc"
+        if os.path.exists(old_lrc) and not os.path.exists(new_lrc):
+            try:
+                os.rename(old_lrc, new_lrc)
+            except OSError:
+                pass
+        done.append((plan.old, plan.new))
+    return done
+
+
 def finalize_download(local_path: str, options: FinalizeOptions) -> str:
     """Convert (if enabled and lossless), rename, and move *local_path*
     into ``options.library_dir``. Returns the final path.
