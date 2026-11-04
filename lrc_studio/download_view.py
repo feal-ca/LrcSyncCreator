@@ -3,12 +3,12 @@
 Paste a Spotify track, album, or playlist link: everything missing from
 the library is matched on Soulseek (a few searches at a time, best match
 shown, nothing downloaded yet), the user reviews or overrides matches,
-then commits with "Download All Missing" or a row's "Download".
+then commits with "Download all missing" or a row's "Download".
 
 Downloads run in the shared engine (``TransfersView``), several at once,
 falling back to a row's other candidates when a peer rejects, never
 answers or sits in its queue too long. Each row mirrors its transfer's
-live status. Once "Download All Missing" is clicked, tracks still being
+live status. Once "Download all missing" is clicked, tracks still being
 searched start downloading as soon as they're matched.
 """
 
@@ -42,12 +42,12 @@ from workers import (
 QUEUE_PATIENCE_S = 180.0
 
 _STATUS_LABELS = {
-    "in_library":      "In Library",
-    "queued":          "Queued",
+    "in_library":      "In library",
+    "queued":          "Waiting to search",
     "searching":       "Searching…",
     "matched":         "Matched",
-    "no_results":      "No Results",
-    "search_failed":   "Search Failed",
+    "no_results":      "Not on Soulseek",
+    "search_failed":   "Search failed",
     "download_queued": "Waiting to start",
     "downloading":     "Downloading…",
     "downloaded":      "Downloaded",
@@ -120,7 +120,7 @@ class DownloadView(QWidget):
         self._rows: list[_RowState] = []
         self._newly_downloaded: list[str] = []
         self._item_rows: dict[int, int] = {}   # unfinished TransfersView item id -> row
-        self._auto_download = False            # "Download All Missing" was clicked
+        self._auto_download = False            # "Download all missing" was clicked
         self._batch_total = 0
         self._batch_done = 0
 
@@ -218,7 +218,7 @@ class DownloadView(QWidget):
         layout.addWidget(self.progress_bar)
 
         bottom_row = QHBoxLayout()
-        self.download_button = QPushButton("Download All Missing")
+        self.download_button = QPushButton("Download all missing")
         self.download_button.setToolTip(
             "Download every matched track now, and every track still being "
             "searched as soon as it's matched"
@@ -384,7 +384,7 @@ class DownloadView(QWidget):
         else:
             self.status_label.setText(
                 f"Search done: {matched} matched, {missing} not found. Check the Match "
-                "column, then click Download All Missing."
+                "column, then click Download all missing."
             )
         self._refresh_download_button()
         self._maybe_finish_batch()
@@ -444,11 +444,11 @@ class DownloadView(QWidget):
         n = len(self._downloadable())
         searching = self._search_thread is not None and self._search_thread.isRunning()
         if n:
-            self.download_button.setText(f"Download All Missing ({n})")
+            self.download_button.setText(f"Download {n} missing")
         elif self._auto_download and searching:
             self.download_button.setText("New matches download automatically")
         else:
-            self.download_button.setText("Download All Missing")
+            self.download_button.setText("Download all missing")
         self.download_button.setEnabled(n > 0 or (searching and not self._auto_download and bool(self._rows)))
 
     def _download_all(self) -> None:
@@ -641,7 +641,7 @@ class DownloadView(QWidget):
 
         if state.item_id is not None:
             if len(state.candidates) > 1:
-                skip_btn = QPushButton("Other source")
+                skip_btn = QPushButton("Try another copy")
                 skip_btn.setToolTip("Give up on this peer and try the next candidate now")
                 skip_btn.clicked.connect(partial(self._transfers.skip_source, state.item_id))
                 row_layout.addWidget(skip_btn)
@@ -650,12 +650,12 @@ class DownloadView(QWidget):
             row_layout.addWidget(cancel_btn)
         elif state.status not in _NO_ACTION_STATUSES:
             if state.candidates:
-                choose_btn = QPushButton("Change Match")
+                choose_btn = QPushButton("Pick another copy…")
                 choose_btn.setToolTip("Pick a different Soulseek result for this track")
                 choose_btn.clicked.connect(partial(self._choose_match, row_index))
                 row_layout.addWidget(choose_btn)
             else:
-                retry_btn = QPushButton("Retry Search")
+                retry_btn = QPushButton("Search again")
                 retry_btn.clicked.connect(partial(self._retry_search, row_index))
                 row_layout.addWidget(retry_btn)
 

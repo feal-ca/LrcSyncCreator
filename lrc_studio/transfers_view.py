@@ -17,7 +17,7 @@ from functools import partial
 from typing import Callable
 
 from PyQt6.QtCore import QModelIndex, QRect, QSettings, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QPainter
+from PyQt6.QtGui import QAction, QColor, QKeySequence, QPainter
 from PyQt6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QMenu, QPushButton,
     QStyledItemDelegate, QStyleOptionViewItem, QTableWidget, QTableWidgetItem,
@@ -31,13 +31,13 @@ from workers import TransferThread, stop_thread
 
 MAX_ACTIVE = 6
 
-COL_NAME, COL_FROM, COL_PROGRESS = range(3)
+COL_NAME, COL_PROGRESS = range(2)
 _PERCENT_ROLE = Qt.ItemDataRole.UserRole + 1
 
 _PHASE_TEXT = {
     "waiting": "Waiting",
-    "requesting": "Requesting…",
-    "queued": "In peer's queue",
+    "requesting": "Starting…",
+    "queued": "Queued by uploader",
     "downloading": "Downloading",
     "processing": "Finishing…",
     "done": "In library",
@@ -120,12 +120,12 @@ class TransfersView(QWidget):
         layout.setContentsMargins(0, 4, 0, 0)
         layout.setSpacing(10)
 
-        self.summary = QLabel("Nothing downloading. Pick files on the Search page.")
+        self.summary = QLabel("Nothing downloading. Find music on the Search page (Ctrl+F).")
         self.summary.setProperty("role", "muted")
         layout.addWidget(self.summary)
 
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["File", "From", "Status"])
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Song", "Status"])
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -137,27 +137,31 @@ class TransfersView(QWidget):
         header.setHighlightSections(False)
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(COL_FROM, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(COL_PROGRESS, QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(COL_FROM, 140)
-        header.resizeSection(COL_PROGRESS, 340)
+        header.resizeSection(COL_PROGRESS, 380)
         self.table.setItemDelegateForColumn(COL_PROGRESS, _ProgressDelegate(self.table))
         self.table.itemDoubleClicked.connect(self._on_double_clicked)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
         self.table.itemSelectionChanged.connect(self._update_buttons)
+        delete = QAction(self.table)
+        delete.setShortcut(QKeySequence(QKeySequence.StandardKey.Delete))
+        delete.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
+        delete.triggered.connect(self.cancel_selected)
+        self.table.addAction(delete)
         layout.addWidget(self.table, stretch=1)
 
         row = QHBoxLayout()
         self.retry_button = QPushButton("Retry failed")
         self.retry_button.clicked.connect(self.retry_failed)
-        self.cancel_button = QPushButton("Cancel selected")
-        self.cancel_button.clicked.connect(self.cancel_selected)
         self.clear_button = QPushButton("Clear finished")
         self.clear_button.setProperty("variant", "ghost")
         self.clear_button.clicked.connect(self.clear_finished)
         row.addWidget(self.retry_button)
-        row.addWidget(self.cancel_button)
+        hint = QLabel("Double-click a finished song to open it. Del cancels, right-click for more.")
+        hint.setProperty("role", "faint")
+        row.addSpacing(8)
+        row.addWidget(hint)
         row.addStretch(1)
         row.addWidget(self.clear_button)
         layout.addLayout(row)
@@ -275,8 +279,7 @@ class TransfersView(QWidget):
         item.file = file
         row = self._row_for(item_id)
         if row is not None:
-            self.table.item(row, COL_NAME).setText(file.display_name)
-            self.table.item(row, COL_FROM).setText(file.username)
+            self._label_name(self.table.item(row, COL_NAME), file)
         self.item_source_changed.emit(item_id, file)
 
     def _on_finished(self, item_id: int, ok: bool, detail: str, path: str) -> None:
@@ -285,7 +288,7 @@ class TransfersView(QWidget):
             return
         if ok:
             item.final_path = path
-            self._set_phase(item, "done", -1, f"In library as {os.path.basename(path)}")
+            self._set_phase(item, "done", -1, "In library")
             self.file_ready.emit(path)
         elif detail == "Cancelled.":
             self._set_phase(item, "cancelled", -1, "Cancelled")
@@ -336,15 +339,17 @@ class TransfersView(QWidget):
             return
         menu = QMenu(self)
         running = [i for i in items if i.id in self._threads and len(i.candidates) > 1]
-        if len(running) == 1:
-            menu.addAction("Try another source now", lambda: self.skip_source(running[0].id))
-        if any(i.phase not in _FINISHED for i in items):
-            menu.addAction("Cancel", self.cancel_selected)
-        if any(i.phase in ("failed", "cancelled") for i in items):
-            menu.addAction("Retry", lambda: self.retry_failed(items))
         done = [i for i in items if i.phase == "done" and i.final_path]
         if len(done) == 1:
-            menu.addAction("Open in editor", lambda: self.open_requested.emit(done[0].final_path))
+            menu.addAction("Open in Editor", lambda: self.open_requested.emit(done[0].final_path))
+        if len(running) == 1:
+            menu.addAction("Try Another Copy", lambda: self.skip_source(running[0].id))
+        if any(i.phase in ("failed", "cancelled") for i in items):
+            menu.addAction("Retry", lambda: self.retry_failed(items))
+        if any(i.phase not in _FINISHED for i in items):
+            cancel = menu.addAction("Cancel", self.cancel_selected)
+            cancel.setShortcut(QKeySequence(QKeySequence.StandardKey.Delete))
+            cancel.setShortcutContext(Qt.ShortcutContext.WidgetShortcut)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _on_double_clicked(self, cell: QTableWidgetItem) -> None:
@@ -357,15 +362,17 @@ class TransfersView(QWidget):
     def _append_row(self, item: TransferItem) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
-        name = QTableWidgetItem(item.file.display_name)
+        name = QTableWidgetItem()
         name.setData(Qt.ItemDataRole.UserRole, item.id)
-        name.setToolTip(item.file.filename.replace("\\", "/"))
-        source = QTableWidgetItem(item.file.username)
-        source.setForeground(QColor(theme.TEXT_2))
+        self._label_name(name, item.file)
         self.table.setItem(row, COL_NAME, name)
-        self.table.setItem(row, COL_FROM, source)
         self.table.setItem(row, COL_PROGRESS, QTableWidgetItem())
         self._render(row, item)
+
+    @staticmethod
+    def _label_name(cell: QTableWidgetItem, file: SoulseekFile) -> None:
+        cell.setText(os.path.splitext(file.display_name)[0])
+        cell.setToolTip(f"From {file.username}\n{file.filename.replace(chr(92), '/')}")
 
     def _set_phase(self, item: TransferItem, phase: str, percent: int, text: str) -> None:
         item.phase, item.percent, item.text = phase, percent, text
@@ -399,7 +406,7 @@ class TransfersView(QWidget):
         done = sum(1 for i in self._items if i.phase == "done")
         failed = sum(1 for i in self._items if i.phase == "failed")
         if not self._items:
-            self.summary.setText("Nothing downloading. Pick files on the Search page.")
+            self.summary.setText("Nothing downloading. Find music on the Search page (Ctrl+F).")
         else:
             parts = []
             if active:
@@ -414,7 +421,6 @@ class TransfersView(QWidget):
 
     def _update_buttons(self) -> None:
         self.retry_button.setEnabled(any(i.phase in ("failed", "cancelled") for i in self._items))
-        self.cancel_button.setEnabled(any(i.phase not in _FINISHED for i in self._selected_items()))
         self.clear_button.setEnabled(any(i.phase in _FINISHED for i in self._items))
 
     # -- lookup ---------------------------------------------------------------

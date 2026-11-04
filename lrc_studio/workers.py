@@ -384,10 +384,10 @@ def describe_transfer(file: SoulseekFile, state: str, done: int, place: int | No
         return "downloading", 100, "100%"
     if state == "Queued, Remotely" or (state.startswith("Queued") and place):
         where = f" (#{place})" if place else ""
-        return "queued", 0, f"In {file.username}'s queue{where} · {_fmt_clock(in_state_s)}"
+        return "queued", 0, f"Queued by uploader{where} · {_fmt_clock(in_state_s)}"
     if state == "Initializing":
-        return "requesting", 0, f"{file.username} is about to send…"
-    return "requesting", 0, f"Waiting for {file.username} to answer · {_fmt_clock(in_state_s)}"
+        return "requesting", 0, "Starting…"
+    return "requesting", 0, f"Waiting for the uploader to answer · {_fmt_clock(in_state_s)}"
 
 
 class TransferThread(QThread):
@@ -459,8 +459,8 @@ class TransferThread(QThread):
             self._current = file
             self._skip_event.clear()
             self.source_changed.emit(self.item_id, file)
-            note = f"Trying another source ({tried} of {self._max_attempts})… " if tried > 1 else ""
-            self.status.emit(self.item_id, "requesting", 0, f"{note}Asking {file.username}…")
+            note = f"Trying another copy ({tried} of {self._max_attempts}). " if tried > 1 else ""
+            self.status.emit(self.item_id, "requesting", 0, f"{note}Starting…")
             try:
                 self._client.download(file)
             except SlskdConnectionError as exc:

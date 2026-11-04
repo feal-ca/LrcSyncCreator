@@ -225,7 +225,7 @@ def test_peer_that_never_answers_is_abandoned(monkeypatch, tmp_path):
     _attempts, done, statuses = _run_thread(monkeypatch, tmp_path, client, [_cand("silent"), _cand("good")], good_peer="good")
 
     assert client.requested == ["silent", "good"]
-    assert any("Waiting for silent to answer" in text for _phase, text in statuses)
+    assert any("Waiting for the uploader to answer" in text for _phase, text in statuses)
     assert done[-1][0] is True
 
 
@@ -239,7 +239,7 @@ def test_long_peer_queue_moves_on_only_with_patience_set(monkeypatch, tmp_path):
     )
 
     assert client.requested == ["busy", "good"]
-    assert ("queued", "In busy's queue (#40) · 0:00") in statuses
+    assert ("queued", "Queued by uploader (#40) · 0:00") in statuses
     assert done[-1][0] is True
 
 

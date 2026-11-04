@@ -265,8 +265,8 @@ def test_row_mirrors_live_transfer_status_and_result(engine_view):
     done = []
     view.file_downloaded.connect(done.append)
 
-    engine.item_changed.emit(item_id, "queued", 0, "In a's queue (#3) · 1:10")
-    assert view.table.item(0, 1).text() == "In a's queue (#3) · 1:10"
+    engine.item_changed.emit(item_id, "queued", 0, "Queued by uploader (#3) · 1:10")
+    assert view.table.item(0, 1).text() == "Queued by uploader (#3) · 1:10"
 
     engine.item_source_changed.emit(item_id, view._rows[0].candidates[1])
     assert view._rows[0].selected.username == "b"

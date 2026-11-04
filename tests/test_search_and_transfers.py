@@ -238,3 +238,22 @@ def test_file_of_maps_item_ids_back_to_files_even_when_some_were_skipped(transfe
 
     assert [transfers.file_of(i).filename for i in ids] == [b.filename]
     assert transfers.file_of(9999) is None
+
+
+
+def test_downloads_table_shows_song_and_status_with_the_uploader_in_the_tooltip(transfers):
+    [item_id] = transfers.enqueue([_f("music\\Rosalía\\Malamente.flac")])
+
+    assert transfers.table.columnCount() == 2
+    assert transfers.table.item(0, 0).text() == "Malamente"
+    assert "From" in transfers.table.item(0, 0).toolTip()
+
+
+def test_delete_key_cancels_the_selected_downloads(transfers):
+    transfers.enqueue([_f("a\\1.mp3")])
+    transfers.table.selectRow(0)
+
+    [delete] = [a for a in transfers.table.actions() if a.shortcut().toString() == "Del"]
+    delete.trigger()
+
+    assert transfers.table.item(0, 1).text() in ("Cancelling…", "Cancelled")
