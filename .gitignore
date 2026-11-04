@@ -15,3 +15,6 @@ slskd-bin/
 /website.png
 /prototip*.png
 /shape.svg
+
+# Local agent scratch (plan ledgers)
+.superpowers/
