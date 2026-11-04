@@ -88,6 +88,14 @@ Detailed from the aioslsk research report. Outline:
 
 Detailed from the lyrics-provider research report. Outline: providers module, NetEase credit-line stripping, cross-checking to pick the best candidate, picker searches every source in one pass, plain lyrics only upgrade to synced.
 
+Research findings (lyrics subagent; draft in plan workspace `lyrics/lyrics_sources.py`):
+- Add Megalobiz public API (official, duration-aware; 30 req/min anonymous, honour 429), QQ Music (Referer header; credit banners to strip), NetEase direct (`/api/cloudsearch/pc`, no cookie; try up to 3 ids). Kugou is redundant with QQ; Lyricsify/Deezer/Apple/Textyl unusable.
+- YouTube Music (ytmusicapi, MIT) is the only extra source covering the Catalan/Spanish long tail, but it impersonates the Android app (ToS-doubtful) and is slow: optional dependency, off by default, used only when the user turns it on.
+- Drop syncedlyrics: its Megalobiz path is dead (410), Musixmatch decoy-prone, NetEase cookie stale.
+- LRCLIB `/api/search?q=` finds entries the track_name/artist_name search misses (Amagada primavera, Malamente, Sherine): also query `q=`.
+- Cross-check by line-pair time deltas (densest 2 s cluster; agree when ≥60 % lines within ±1 s and |offset| ≤ 1.5 s). LRCLIB `/get` can be 16 s off (Get Lucky): disagreement with two agreeing providers beats a single `/get` hit.
+- `clean_lrc` strips ID tags, credit lines (作词/作曲/…, "Lyrics by：") and "Title - Artist" banners before the first sung line.
+
 User ruling (2026-11-04): auto-fetch must NOT become stricter than today; the goal is MORE songs with lyrics. Extra providers raise coverage, cross-checking chooses among candidates, and only clearly broken results are dropped (credit-line junk, decoys, timing past the end of the song, a different song entirely). Plain lyrics are still saved when nothing synced exists, as today.
 
 ## Phase B detail (from the aioslsk research; facade sketch kept in the plan workspace `aioslsk/slsk_client.py`)

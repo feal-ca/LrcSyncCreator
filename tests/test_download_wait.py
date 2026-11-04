@@ -275,3 +275,21 @@ def test_describe_transfer_shows_speed_and_time_left():
     assert (phase, pct) == ("downloading", 50)
     assert text.startswith("50% · 200 KB/s · ")
     assert text.endswith(" left")
+
+
+def test_uses_the_clients_local_path_for_a_renamed_duplicate(monkeypatch, tmp_path):
+    # The client saves a second copy of a name as "name (1).ext": a lookup
+    # by basename can't see it, the transfer's own localPath can.
+    clock = _FakeClock()
+    monkeypatch.setattr(workers.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(workers.time, "sleep", clock.sleep)
+    landed = tmp_path / "Ma beauté (1).flac"
+    landed.write_bytes(b"x")
+    client = _ScriptedClient(clock, lambda now: {
+        "state": "Completed, Succeeded", "bytesTransferred": _SIZE, "localPath": str(landed),
+    })
+
+    ok, detail, path = workers.wait_for_download(client, str(tmp_path), _file(), timeout_s=60)
+
+    assert ok
+    assert path == str(landed)

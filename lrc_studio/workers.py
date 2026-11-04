@@ -20,7 +20,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from postprocess import unique_path
 
 from soulseek import (
-    SlskdClient, SlskdConnectionError, SlskdError, SoulseekFile,
+    SlskdConnectionError, SlskdError, SoulseekClient, SoulseekFile,
     find_best_candidates, find_downloaded_file,
 )
 
@@ -155,7 +155,7 @@ class LyricsSearchThread(QThread):
 
 
 def wait_for_download(
-    client: SlskdClient,
+    client: SoulseekClient,
     downloads_dir: str,
     file: SoulseekFile,
     timeout_s: float,
@@ -167,19 +167,19 @@ def wait_for_download(
     on_status: Callable[[str, int, int | None, float, float], None] | None = None,
     skip_event: threading.Event | None = None,
 ) -> tuple[bool, str, str]:
-    """Poll until *file* lands in ``downloads_dir``.
+    """Poll until *file* has finished downloading into ``downloads_dir``.
 
-    slskd hands off the actual peer-to-peer transfer; this just polls for
-    the file's arrival (see ``find_downloaded_file``) rather than trusting
-    any specific transfer-state schema to signal completion.
+    Completion is the client reporting "Completed, Succeeded" with the
+    file's local path (which may carry a " (1)" suffix), or, as a fallback,
+    the file turning up in ``downloads_dir`` by name and size.
 
     *timeout_s* is how long to wait **without progress**, not in total:
-    every poll also reads slskd's transfer record, and any change in
+    every poll also reads the client's transfer record, and any change in
     bytes transferred, state, or queue position resets the clock — a
     24 MB FLAC from a peer uploading at ~130 KB/s legitimately takes over
     three minutes, and used to be reported as failed seconds before it
-    finished. A transfer slskd itself marks as failed (rejected, errored,
-    timed out, cancelled) ends the wait immediately with slskd's reason.
+    finished. A transfer the client marks as failed (rejected, errored,
+    timed out, cancelled) ends the wait immediately with its reason.
     *max_total_s* is a backstop so nothing waits forever.
 
     *queued_timeout_s* replaces *timeout_s* while the transfer sits in a
@@ -218,6 +218,10 @@ def wait_for_download(
         now = time.monotonic()
         transfer = client.get_download_transfer(file.username, file.filename) or {}
         state = transfer.get("state") or ""
+        reported = transfer.get("localPath")
+        if state == "Completed, Succeeded" and reported and os.path.exists(reported):
+            local_path = reported
+            break
         done = transfer.get("bytesTransferred") or 0
         place = transfer.get("placeInQueue")
         signature = (state, done, place)
@@ -273,7 +277,7 @@ def move_into_library(local_path: str, library_dir: str) -> str:
 
 
 def wait_for_download_and_move(
-    client: SlskdClient,
+    client: SoulseekClient,
     downloads_dir: str,
     library_dir: str,
     file: SoulseekFile,
@@ -316,12 +320,12 @@ def wait_for_download_and_move(
 
 
 class SoulseekSearchThread(QThread):
-    """Run a Soulseek search via slskd without blocking the UI."""
+    """Run a Soulseek search without blocking the UI."""
 
     results_ready = pyqtSignal(list)   # list[SoulseekFile]
     search_failed = pyqtSignal(str)
 
-    def __init__(self, client: SlskdClient, query: str) -> None:
+    def __init__(self, client: SoulseekClient, query: str) -> None:
         super().__init__()
         self._client = client
         self._query = query
@@ -341,7 +345,7 @@ class SoulseekLiveSearchThread(QThread):
     results_ready = pyqtSignal(list)       # list[SoulseekFile]
     search_failed = pyqtSignal(str)
 
-    def __init__(self, client: SlskdClient, query: str, wait_s: float = 25.0) -> None:
+    def __init__(self, client: SoulseekClient, query: str, wait_s: float = 25.0) -> None:
         super().__init__()
         self._client = client
         self.query = query
@@ -372,7 +376,7 @@ class FolderBrowseThread(QThread):
     results_ready = pyqtSignal(list)   # list[SoulseekFile]
     failed        = pyqtSignal(str)
 
-    def __init__(self, client: SlskdClient, like: SoulseekFile) -> None:
+    def __init__(self, client: SoulseekClient, like: SoulseekFile) -> None:
         super().__init__()
         self._client = client
         self._like = like
@@ -425,7 +429,7 @@ class TransferThread(QThread):
 
     *candidates* is the file to get first plus alternatives (other peers'
     copies). A source that rejects the request, errors, never answers, or
-    stops sending for ``STALL_TIMEOUT_S`` is cancelled in slskd and the
+    stops sending for ``STALL_TIMEOUT_S`` is cancelled and the
     next one is tried, skipping peers that already failed, up to
     *max_attempts*. *queue_patience_s* is how long to sit in a peer's
     upload queue before moving on; None waits as long as it takes (a file
@@ -446,7 +450,7 @@ class TransferThread(QThread):
     def __init__(
         self,
         item_id: int,
-        client: SlskdClient,
+        client: SoulseekClient,
         downloads_dir: str,
         candidates: list[SoulseekFile] | SoulseekFile,
         finalize: Callable[[str], str],
@@ -581,7 +585,7 @@ class PlaylistSearchThread(QThread):
 
     Decoupled from downloading: this only fills each row's candidate list
     (best match first) for review. ``CONCURRENCY`` searches run at once;
-    slskd handles parallel searches fine and it cuts a 30-track playlist
+    the client handles parallel searches fine and it cuts a 30-track playlist
     from several minutes to about one.
     """
 
@@ -594,7 +598,7 @@ class PlaylistSearchThread(QThread):
     track_failed    = pyqtSignal(int, str)       # (row_index, message)
     finished_search = pyqtSignal()
 
-    def __init__(self, client: SlskdClient, rows: list[tuple[int, "SpotifyTrack"]]) -> None:
+    def __init__(self, client: SoulseekClient, rows: list[tuple[int, "SpotifyTrack"]]) -> None:
         super().__init__()
         self._client = client
         self._rows = rows
@@ -624,7 +628,7 @@ class PlaylistSearchThread(QThread):
             with self._lock:
                 self._connection_failures += 1
                 if self._connection_failures >= 2 and not self._cancel_event.is_set():
-                    self.progress.emit("slskd isn't responding — stopping the search.")
+                    self.progress.emit("Soulseek isn't responding, so the search stopped.")
                     self._cancel_event.set()
             return
         except SlskdError as exc:

@@ -17,7 +17,7 @@ from PyQt6.QtWidgets import QApplication
 import search_view
 import transfers_view
 import workers
-from soulseek import ResultFilter, SlskdClient, SoulseekFile, normalize_text
+from soulseek import ResultFilter, SoulseekFile, normalize_text
 
 
 @pytest.fixture(scope="module")
@@ -84,80 +84,6 @@ def test_results_widget_filters_live(qapp):
     w.format_combo.setCurrentIndex(w.format_combo.findData("lossless"))
     assert w.visible_count() == 1
     assert w.file_at_proxy_row(0).filename.endswith(".flac")
-
-
-# -- SlskdClient: folder browse + live search ----------------------------------
-
-class _Resp:
-    def __init__(self, payload):
-        self._payload = payload
-
-    def json(self):
-        return self._payload
-
-
-def test_browse_folder_joins_bare_filenames_and_copies_peer_stats(monkeypatch):
-    client = SlskdClient("http://x", "k")
-    calls = []
-
-    def fake_request(method, path, **kwargs):
-        calls.append((method, path, kwargs.get("json")))
-        return _Resp([{"name": "music\\Manu Chao\\Clandestino", "files": [
-            {"filename": "01 - Clandestino.mp3", "size": 10, "bitRate": 320},
-            {"filename": "cover.jpg", "size": 1},
-            {"filename": "music\\Manu Chao\\Clandestino\\02 - Desaparecido.mp3", "size": 11},
-        ]}])
-
-    monkeypatch.setattr(client, "_request", fake_request)
-    like = _f("music\\Manu Chao\\Clandestino\\01 - Clandestino.mp3", user="peer x", queue=3, free=False)
-
-    files = client.browse_folder(like.username, like.folder, like=like)
-
-    assert calls[0][1] == "/api/v0/users/peer%20x/directory"
-    assert calls[0][2] == {"directory": "music\\Manu Chao\\Clandestino"}
-    assert [f.filename for f in files] == [
-        "music\\Manu Chao\\Clandestino\\01 - Clandestino.mp3",
-        "music\\Manu Chao\\Clandestino\\02 - Desaparecido.mp3",
-    ]
-    assert all(f.queue_length == 3 and not f.has_free_slot for f in files)
-
-
-def test_browse_folder_accepts_a_single_directory_object(monkeypatch):
-    client = SlskdClient("http://x", "k")
-    monkeypatch.setattr(client, "_request", lambda *a, **k: _Resp(
-        {"name": "a/b", "files": [{"filename": "song.opus", "size": 3}]}
-    ))
-    files = client.browse_folder("u", "a/b")
-    assert [f.filename for f in files] == ["a/b/song.opus"]
-
-
-def test_search_reports_progress_and_stops_early(monkeypatch):
-    client = SlskdClient("http://x", "k")
-    stop = threading.Event()
-    progress = []
-    requests_made = []
-
-    def fake_request(method, path, **kwargs):
-        requests_made.append((method, path))
-        if method == "POST":
-            return _Resp({"id": "s1"})
-        if method == "GET" and path.endswith("/responses"):
-            return _Resp([{"username": "u", "queueLength": 0, "hasFreeUploadSlot": True,
-                           "files": [{"filename": "a\\Song.mp3", "size": 5, "bitRate": 320}]}])
-        if method == "GET":
-            stop.set()   # the user clicks "Show results now" after the first poll
-            return _Resp({"isComplete": False, "responseCount": 4, "fileCount": 37})
-        return _Resp({})
-
-    monkeypatch.setattr(client, "_request", fake_request)
-    monkeypatch.setattr("soulseek.time.sleep", lambda s: None)
-
-    results = client.search("song", wait_s=60, on_progress=lambda p, f: progress.append((p, f)),
-                            stop_event=stop)
-
-    assert progress == [(4, 37)]
-    assert ("PUT", "/api/v0/searches/s1") in requests_made   # search stopped, not waited out
-    assert [r.display_name for r in results] == ["Song.mp3"]
 
 
 # -- wait_for_download: hand-picked downloads may queue indefinitely ------------

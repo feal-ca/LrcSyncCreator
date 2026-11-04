@@ -72,3 +72,21 @@ def test_tag_edit_dialog_reports_write_errors(qapp, monkeypatch):
 
     assert "read-only file" in dialog.error_label.text()
     assert dialog.result() != dialog.DialogCode.Accepted
+
+
+def test_settings_dialog_saves_the_soulseek_account(qapp, tmp_path):
+    from PyQt6.QtCore import QSettings
+
+    settings = QSettings(str(tmp_path / "s.ini"), QSettings.Format.IniFormat)
+    dialog = dialogs.SettingsDialog(settings, soulseek_status="Connected to Soulseek.")
+    assert dialog.soulseek_status.text() == "Connected to Soulseek."
+    assert not hasattr(dialog, "slskd_url")
+
+    dialog.soulseek_username.setText("Me")
+    dialog.soulseek_password.setText("pw")
+    dialog.share_check.setChecked(False)
+    dialog._save()
+
+    assert settings.value("soulseek_username") == "Me"
+    assert settings.value("soulseek_password") == "pw"
+    assert settings.value("share_library") in (False, "false")

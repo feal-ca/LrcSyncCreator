@@ -1,15 +1,7 @@
-"""soulseek.py — thin REST client for slskd (https://github.com/slskd/slskd).
-
-LRC Studio never speaks the Soulseek protocol itself; slskd owns the P2P
-connection and exposes a small REST API that this module wraps. Install it
-once via ``scripts/setup_slskd.sh`` — after that, ``app.py`` starts it
-itself (via ``scripts/run_slskd.sh``) the first time it's needed.
-
-Endpoint shapes here were confirmed against a live slskd 0.26.0 instance
-(search + response schema); the download-completion path is intentionally
-schema-tolerant (see ``find_downloaded_file``) since triggering a real
-transfer wasn't something to do casually against a stranger's upload slot
-during development.
+"""soulseek.py — what LRC Studio knows about Soulseek files, independent
+of how it talks to the network: the SoulseekFile record, quality and
+availability ranking, the results filter, and the automatic matcher used
+by the Spotify import. The network side lives in slsk_client.py.
 """
 
 from __future__ import annotations
@@ -22,12 +14,12 @@ import unicodedata
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import Callable
-from urllib.parse import quote
 
-import requests
+from typing import Protocol
+
 from rapidfuzz import fuzz
 
-AUDIO_EXTENSIONS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus")
+AUDIO_EXTENSIONS = (".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aiff", ".aif")
 
 # Below this fuzzy relevance score (0-100) a search result is dropped as
 # "probably not the right song" rather than just ranked lower. Looser than
@@ -74,22 +66,26 @@ def clean_query_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-class SlskdError(Exception):
-    """Raised for any slskd connectivity/API failure."""
+class SoulseekError(Exception):
+    """Any Soulseek failure the user should hear about."""
 
     def __init__(self, message: str, status_code: int | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
 
 
-class SlskdConnectionError(SlskdError):
-    """slskd is unreachable (not running, wrong URL, network down).
+class SoulseekConnectionError(SoulseekError):
+    """Not connected to the Soulseek network (offline, logged out).
 
-    Distinguished from other SlskdErrors so callers looping over many
-    tracks can fail fast instead of repeating the same doomed request
-    once per track — see the circuit-breakers in PlaylistSearchThread
-    and PlaylistDownloadThread.
+    Distinguished from other errors so callers looping over many tracks
+    can fail fast instead of repeating the same doomed request once per
+    track — see the circuit-breaker in PlaylistSearchThread.
     """
+
+
+# Older names, still used across the download engine.
+SlskdError = SoulseekError
+SlskdConnectionError = SoulseekConnectionError
 
 
 @dataclass
@@ -111,8 +107,8 @@ class SoulseekFile:
 
     @property
     def folder(self) -> str:
-        """Remote directory, in the peer's own separators (what slskd's
-        browse endpoint expects back)."""
+        """Remote directory, in the peer's own separators (what a folder
+        browse request expects back)."""
         sep_at = max(self.filename.rfind("\\"), self.filename.rfind("/"))
         return self.filename[:sep_at] if sep_at >= 0 else ""
 
@@ -198,251 +194,16 @@ def availability_key(f: SoulseekFile) -> tuple:
     )
 
 
-class SlskdClient:
-    """Minimal wrapper around slskd's ``/api/v0`` REST endpoints."""
+class SoulseekClient(Protocol):
+    """What the download engine needs from a Soulseek client
+    (slsk_client.SlskClient; tests pass small fakes)."""
 
-    def __init__(self, base_url: str, api_key: str, timeout_s: float = 10.0) -> None:
-        self.base_url = base_url.rstrip("/")
-        self._headers = {"X-API-Key": api_key}
-        self.timeout_s = timeout_s
-
-    def _request(self, method: str, path: str, **kwargs):
-        try:
-            resp = requests.request(
-                method, f"{self.base_url}{path}",
-                headers=self._headers, timeout=self.timeout_s, **kwargs,
-            )
-            resp.raise_for_status()
-            return resp
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-            # Short, classified message — the underlying urllib3 exception
-            # text can run to hundreds of characters and is useless noise
-            # repeated once per track in a batch import.
-            raise SlskdConnectionError(
-                f"Can't reach slskd at {self.base_url} — is it running? "
-                "(Tools -> Settings -> Test Connection)"
-            ) from exc
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else None
-            detail = ""
-            if exc.response is not None:
-                try:
-                    detail = exc.response.text.strip()
-                except Exception:
-                    detail = ""
-            suffix = f": {detail}" if detail else ""
-            raise SlskdError(
-                f"slskd returned HTTP {status if status is not None else '?'} "
-                f"for {method} {path}{suffix}",
-                status_code=status,
-            ) from exc
-        except requests.RequestException as exc:
-            raise SlskdError(f"slskd request failed ({method} {path}): {exc}") from exc
-
-    def check_connection(self) -> tuple[bool, str]:
-        """Return (ok, message) — reachable *and* logged in to Soulseek."""
-        try:
-            data = self._request("GET", "/api/v0/application").json()
-        except SlskdError as exc:
-            return False, str(exc)
-        server = data.get("server", {})
-        if server.get("isLoggedIn"):
-            return True, "Connected to Soulseek."
-        if server.get("isConnecting") or server.get("isLoggingIn"):
-            return False, "slskd is still connecting to Soulseek — try again shortly."
-        return False, "slskd is running but not logged in to Soulseek (check its credentials)."
-
-    def _post_search(self, query: str, search_timeout_ms: int | None = None):
-        """POST a new search, retrying once on a transient 409.
-
-        slskd returns 409 for ``POST /api/v0/searches`` when its own
-        connection to the Soulseek server isn't in a connected+logged-in
-        state at that instant (see ``SearchesController.Post`` /
-        ``SoulseekClient.SearchAsync`` upstream) — including a connection
-        that was fine moments ago and is mid-reconnect right now. slskd
-        reconnects on its own, so poll ``check_connection`` briefly and
-        retry once rather than failing the whole search outright.
-        """
-        body: dict = {"searchText": query}
-        if search_timeout_ms:
-            body["searchTimeout"] = int(search_timeout_ms)
-        try:
-            return self._request("POST", "/api/v0/searches", json=body)
-        except SlskdError as exc:
-            if exc.status_code != 409:
-                raise
-            deadline = time.monotonic() + 8.0
-            while time.monotonic() < deadline:
-                ok, _ = self.check_connection()
-                if ok:
-                    break
-                time.sleep(1.0)
-            return self._request("POST", "/api/v0/searches", json=body)
-
-    def search(
-        self, query: str, wait_s: float = 20.0, poll_interval_s: float = 1.0,
-        on_progress: Callable[[int, int], None] | None = None,
-        stop_event: threading.Event | None = None,
-        search_timeout_ms: int | None = None,
-    ) -> list[SoulseekFile]:
-        """Run a search and block until it completes (or *wait_s* elapses).
-
-        Returns audio-file candidates across all responding peers, best
-        candidates first (free upload slot, short queue, higher bitrate).
-
-        Confirmed against a live instance: real searches routinely stay
-        ``isComplete: false`` for 40-90s+ (peers keep trickling in), well
-        past slskd's own advertised ~15s internal timeout — and its
-        ``/responses`` endpoint stays completely empty until the search is
-        actually marked complete, even though the search summary reports a
-        nonzero response count well before then. Waiting out the full
-        natural completion would make every track in a playlist import take
-        up to a minute, so instead: if *wait_s* elapses first, explicitly
-        stop the search (``PUT .../searches/{id}``) — slskd marks it
-        ``Completed, Cancelled`` immediately and ``/responses`` then returns
-        whatever was collected so far, which in practice is the vast
-        majority of the peers that were ever going to answer.
-
-        *on_progress(peers, files)* is called every poll with slskd's live
-        counters, so a UI can show the search filling up even though the
-        responses themselves only arrive at the end. Setting *stop_event*
-        ends the wait early ("show me what you have").
-        """
-        resp = self._post_search(query, search_timeout_ms)
-        search_id = resp.json()["id"]
-
-        deadline = time.monotonic() + wait_s
-        is_complete = False
-        while time.monotonic() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                break
-            state = self._request("GET", f"/api/v0/searches/{search_id}").json()
-            if on_progress is not None:
-                on_progress(int(state.get("responseCount") or 0), int(state.get("fileCount") or 0))
-            if state.get("isComplete"):
-                is_complete = True
-                break
-            time.sleep(poll_interval_s)
-
-        if not is_complete:
-            self._request("PUT", f"/api/v0/searches/{search_id}")
-
-        # /responses lags slightly behind isComplete flipping true (whether
-        # that happened naturally or via the stop above) — confirmed against
-        # a live instance: reading it in the same instant can still race and
-        # come back empty. A few short retries clear that up reliably.
-        responses = []
-        for _ in range(5):
-            responses = self._request("GET", f"/api/v0/searches/{search_id}/responses").json()
-            if responses:
-                break
-            time.sleep(0.5)
-
-        results: list[SoulseekFile] = []
-        for r in responses:
-            username = r.get("username", "")
-            for f in r.get("files", []):
-                name = f.get("filename", "")
-                if not name.lower().endswith(AUDIO_EXTENSIONS):
-                    continue
-                results.append(SoulseekFile(
-                    username=username,
-                    filename=name,
-                    size=f.get("size", 0),
-                    bitrate=f.get("bitRate"),
-                    length_s=f.get("length"),
-                    queue_length=r.get("queueLength", 0),
-                    has_free_slot=r.get("hasFreeUploadSlot", False),
-                    upload_speed=r.get("uploadSpeed"),
-                ))
-
-        results.sort(key=availability_key)
-        return results
-
-    def browse_folder(self, username: str, directory: str, like: SoulseekFile | None = None) -> list[SoulseekFile]:
-        """Every audio file in one of *username*'s shared folders.
-
-        Used for "download the whole folder" (an album) — a search only
-        returns the files that matched the query, not their siblings.
-        slskd answers ``POST /users/{username}/directory`` with either one
-        directory object or a list of them, and file names inside may be
-        bare basenames relative to that directory; both are handled. Peer
-        stats (queue, free slot, speed) are copied from *like*, the search
-        result the folder was reached from, since the browse response
-        doesn't carry them.
-        """
-        data = self._request(
-            "POST", f"/api/v0/users/{quote(username, safe='')}/directory",
-            json={"directory": directory},
-        ).json()
-        directories = data if isinstance(data, list) else [data]
-        results: list[SoulseekFile] = []
-        for d in directories:
-            if not isinstance(d, dict):
-                continue
-            dir_name = d.get("name") or directory
-            sep = "\\" if "\\" in dir_name or "/" not in dir_name else "/"
-            for f in d.get("files", []) or []:
-                name = f.get("filename", "")
-                if "\\" not in name and "/" not in name:
-                    name = f"{dir_name}{sep}{name}"
-                if not name.lower().endswith(AUDIO_EXTENSIONS):
-                    continue
-                results.append(SoulseekFile(
-                    username=username,
-                    filename=name,
-                    size=f.get("size", 0),
-                    bitrate=f.get("bitRate"),
-                    length_s=f.get("length"),
-                    queue_length=like.queue_length if like else 0,
-                    has_free_slot=like.has_free_slot if like else False,
-                    upload_speed=like.upload_speed if like else None,
-                ))
-        results.sort(key=lambda r: r.filename.lower())
-        return results
-
-    def download(self, file: SoulseekFile) -> None:
-        """Queue *file* for download from its source peer."""
-        self._request(
-            "POST", f"/api/v0/transfers/downloads/{file.username}",
-            json=[{"filename": file.filename, "size": file.size}],
-        )
-
-    def cancel_download(self, username: str, filename: str) -> None:
-        """Best-effort cancel of an abandoned download, so a stalled
-        transfer that's been given up on doesn't finish later and leave a
-        stray copy behind. Silently does nothing if it can't."""
-        transfer = self.get_download_transfer(username, filename)
-        if not transfer or not transfer.get("id"):
-            return
-        try:
-            self._request(
-                "DELETE", f"/api/v0/transfers/downloads/{username}/{transfer['id']}",
-                params={"remove": "false"},
-            )
-        except SlskdError:
-            pass
-
-    def get_download_transfer(self, username: str, filename: str) -> dict | None:
-        """Best-effort lookup of slskd's transfer record for one download.
-
-        Returns the raw record (``state`` e.g. ``"InProgress"`` /
-        ``"Queued, Remotely"`` / ``"Completed, Rejected"``,
-        ``bytesTransferred``, ``exception``, ``placeInQueue``…), or None if
-        it can't be found. Used to tell a slow-but-moving transfer from a
-        stalled or failed one; completion itself is still confirmed by the
-        file actually landing in the downloads directory (see
-        ``find_downloaded_file``).
-        """
-        try:
-            data = self._request("GET", f"/api/v0/transfers/downloads/{username}").json()
-        except SlskdError:
-            return None
-        for directory in data.get("directories", []) or []:
-            for f in directory.get("files", []) or []:
-                if f.get("filename") == filename:
-                    return f
-        return None
+    def check_connection(self) -> tuple[bool, str]: ...
+    def search(self, query: str, wait_s: float = ..., **kwargs) -> list[SoulseekFile]: ...
+    def browse_folder(self, username: str, directory: str, like: SoulseekFile | None = None) -> list[SoulseekFile]: ...
+    def download(self, file: SoulseekFile) -> None: ...
+    def cancel_download(self, username: str, filename: str) -> None: ...
+    def get_download_transfer(self, username: str, filename: str) -> dict | None: ...
 
 
 def normalize_text(text: str) -> str:
@@ -514,13 +275,9 @@ class ResultFilter:
 
 
 def find_downloaded_file(downloads_dir: str, remote_filename: str, expected_size: int) -> str | None:
-    """Search *downloads_dir* for the local copy of a completed download.
-
-    slskd preserves the peer's directory structure under its downloads
-    directory in a way that varies by version/config, so rather than
-    depend on that layout, this matches on basename + exact size — cheap
-    and reliable for the file counts a single download involves.
-    """
+    """Search *downloads_dir* for the local copy of a completed download,
+    by basename + exact size. A fallback: the client normally reports the
+    exact local path (which may carry a " (1)" suffix this can't see)."""
     target_name = remote_filename.replace("\\", "/").rsplit("/", 1)[-1]
     for root, _dirs, files in os.walk(downloads_dir):
         for fname in files:
@@ -589,10 +346,11 @@ _ARTIST_SPLIT_RE = re.compile(
     r"\s*(?:,|;|&|\bfeat\.?|\bft\.?|\bfeaturing\b|\bx\b)\s*", re.IGNORECASE,
 )
 
-# Automatic matching doesn't need slskd's full 15 s: most peers answer in
-# the first few seconds, and a rare track that needs longer usually isn't
-# there at all.
+# Automatic matching doesn't need a long wait: most peers answer in the
+# first few seconds, and a rare track that needs longer usually isn't
+# there at all. Once results stop arriving for AUTO_SETTLE_S, stop early.
 AUTO_SEARCH_TIMEOUT_MS = 10_000
+AUTO_SETTLE_S = 2.0
 
 
 def query_text(text: str) -> str:
@@ -613,8 +371,8 @@ def build_queries(artist: str, title: str) -> list[str]:
     Artist + title comes first: Soulseek only returns files whose path
     contains every word, so it goes straight to the right copies. A title
     on its own floods for common names ("Your Love" brings back 9,000+
-    files from 250 peers, past slskd's response limit, which can push the
-    right artist's copies out entirely). Title alone and artist alone are
+    files from 250 peers, which can bury the right artist's copies
+    entirely). Title alone and artist alone are
     still tried next, for peers whose folders spell the artist differently.
     """
     a = query_text(primary_artist(artist))
@@ -630,7 +388,7 @@ def build_queries(artist: str, title: str) -> list[str]:
 
 
 def find_best_candidates(
-    client: SlskdClient, artist: str, title: str, min_score: int = _DEFAULT_RELEVANCE_THRESHOLD,
+    client: SoulseekClient, artist: str, title: str, min_score: int = _DEFAULT_RELEVANCE_THRESHOLD,
     on_progress: Callable[[int, int], None] | None = None,
     stop_event: threading.Event | None = None,
 ) -> list[SoulseekFile]:
@@ -648,7 +406,7 @@ def find_best_candidates(
         results = client.search(
             query, wait_s=AUTO_SEARCH_TIMEOUT_MS / 1000 + 4,
             on_progress=on_progress, stop_event=stop_event,
-            search_timeout_ms=AUTO_SEARCH_TIMEOUT_MS,
+            search_timeout_ms=AUTO_SEARCH_TIMEOUT_MS, settle_s=AUTO_SETTLE_S,
         )
         ranked = _filter_and_rank(results, artist, title, min_score)
         if ranked:

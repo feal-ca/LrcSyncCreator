@@ -53,14 +53,14 @@ def window(qapp, monkeypatch, tmp_path):
     import download_view as download_view_module
     monkeypatch.setattr(download_view_module, "PlaylistFetchThread", _FakeFetchThread)
     # _open_batch_import -> DownloadView.start_fetch -> _on_fetch_clicked
-    # calls get_client(), the bound _get_slskd_client method DownloadView
+    # calls get_client(), the bound _get_slsk_client method DownloadView
     # captures at construction time. With no slskd_url/slskd_api_key in
     # this test's fresh settings, the real method pops a blocking
     # QMessageBox.information ("Soulseek Not Configured") and hangs the
     # test. Must be patched on the class before LrcSyncApp() constructs
     # DownloadView — patching the instance afterward wouldn't affect the
     # bound-method object DownloadView already captured.
-    monkeypatch.setattr(app_module.LrcSyncApp, "_get_slskd_client", lambda self: object())
+    monkeypatch.setattr(app_module.LrcSyncApp, "_get_slsk_client", lambda self: object())
 
     win = LrcSyncApp()
     yield win

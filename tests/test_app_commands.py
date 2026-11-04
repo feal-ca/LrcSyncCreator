@@ -147,7 +147,7 @@ def test_find_music_opens_the_search_page(window):
 def test_find_music_routes_spotify_link_to_batch_import(window, monkeypatch):
     calls = []
     clients = []
-    monkeypatch.setattr(window, "_get_slskd_client", lambda: clients.append(1) or object())
+    monkeypatch.setattr(window, "_get_slsk_client", lambda: clients.append(1) or object())
     monkeypatch.setattr(window, "_open_batch_import", lambda link: calls.append(link))
 
     # is_spotify_link() requires a genuine 22-character Spotify ID; a short
@@ -207,7 +207,7 @@ def test_find_music_routes_plain_text_to_soulseek_search(window, monkeypatch):
             return True
 
     monkeypatch.setattr(search_view, "SoulseekLiveSearchThread", _FakeSearchThread)
-    monkeypatch.setattr(window, "_get_slskd_client", lambda: object())
+    monkeypatch.setattr(window, "_get_slsk_client", lambda: object())
     batch_import_calls = []
     monkeypatch.setattr(window, "_open_batch_import", lambda link: batch_import_calls.append(link))
 
@@ -442,21 +442,102 @@ def test_loading_a_song_with_existing_verses_does_not_trigger_the_clear_confirma
     assert asked == []
 
 
-def test_slskd_is_never_restarted_while_downloads_are_running(window, monkeypatch):
-    # Restarting slskd aborts every transfer in flight ("Application shut
-    # down") — seen in a real session when slskd briefly looked offline.
-    window.settings.setValue("slskd_url", "http://127.0.0.1:1")
-    window.settings.setValue("slskd_api_key", "k")
-    monkeypatch.setattr(app_module.SlskdClient, "check_connection", lambda self: (False, "not logged in"))
-    monkeypatch.setattr(window, "_ensure_slskd_running", lambda: True)
-    monkeypatch.setattr(window, "_wait_for_slskd", lambda client, timeout_s=25.0: False)
-    window._slskd_process = type("P", (), {"poll": lambda self: None})()
-    restarts = []
-    monkeypatch.setattr(window, "_restart_slskd", lambda: restarts.append(1) or True)
-    monkeypatch.setattr(window.transfers_view, "active_count", lambda: 2)
+class _FakeSlsk:
+    """Stands in for slsk_client.SlskClient: records how it was built and
+    connects (or fails) instantly, without any network."""
 
-    client = app_module.LrcSyncApp._get_slskd_client(window)
+    fail = None
 
-    assert restarts == []
+    def __init__(self, username, password, downloads_dir, **kwargs):
+        self.args = (username, password, downloads_dir, kwargs)
+        self.connected = False
+        self.closed = False
+        self.credentials_refused = False
+
+    def ensure_connected(self, timeout_s=45.0):
+        if type(self).fail is not None:
+            raise type(self).fail
+        self.connected = True
+
+    def check_connection(self):
+        return (True, "Connected to Soulseek.") if self.connected else (False, "Not connected to Soulseek.")
+
+    def close(self, timeout_s=10.0):
+        self.closed = True
+
+
+@pytest.fixture
+def fake_slsk(monkeypatch, tmp_path):
+    _FakeSlsk.fail = None
+    monkeypatch.setattr(app_module, "SlskClient", _FakeSlsk)
+    monkeypatch.setattr(app_module, "SLSKD_CONFIG_PATH", str(tmp_path / "no-slskd.yml"))
+    return _FakeSlsk
+
+
+def test_soulseek_asks_for_an_account_first(window, fake_slsk, monkeypatch):
+    opened = []
+    monkeypatch.setattr(window, "_open_settings_dialog", lambda: opened.append(1))
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: None)
+
+    assert window._get_slsk_client() is None
+    assert opened == [1]
+
+
+def test_soulseek_account_is_carried_over_from_slskd(window, fake_slsk, monkeypatch, tmp_path):
+    yml = tmp_path / "slskd.yml"
+    yml.write_text("soulseek:\n  username: Me\n  password: pw\n", encoding="utf-8")
+    monkeypatch.setattr(app_module, "SLSKD_CONFIG_PATH", str(yml))
+
+    client = window._get_slsk_client()
+
     assert client is not None
-    window._slskd_process = None
+    assert client.args[:2] == ("Me", "pw")
+    assert window.settings.value("soulseek_username") == "Me"
+
+
+def test_soulseek_client_is_built_once_and_shares_the_music_folder(window, fake_slsk, tmp_path):
+    lib = tmp_path / "Music"
+    lib.mkdir()
+    window.settings.setValue("library_dir", str(lib))
+    window.settings.setValue("soulseek_username", "Me")
+    window.settings.setValue("soulseek_password", "pw")
+
+    first = window._get_slsk_client()
+    second = window._get_slsk_client()
+
+    assert first is second
+    assert first.args[3]["shared_dirs"] == (str(lib),)
+
+
+def test_soulseek_sharing_can_be_turned_off(window, fake_slsk, tmp_path):
+    lib = tmp_path / "Music"
+    lib.mkdir()
+    window.settings.setValue("library_dir", str(lib))
+    window.settings.setValue("soulseek_username", "Me")
+    window.settings.setValue("soulseek_password", "pw")
+    window.settings.setValue("share_library", False)
+
+    assert window._get_slsk_client().args[3]["shared_dirs"] == ()
+
+
+def test_soulseek_login_failure_is_explained(window, fake_slsk, monkeypatch):
+    from soulseek import SlskdError
+
+    window.settings.setValue("soulseek_username", "Me")
+    window.settings.setValue("soulseek_password", "wrong")
+    fake_slsk.fail = SlskdError("Wrong Soulseek password for this username.")
+    shown = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _p, _t, text, *a, **k: shown.append(text))
+
+    assert window._get_slsk_client() is None
+    assert "Wrong Soulseek password" in shown[0]
+
+
+def test_shutdown_closes_the_soulseek_client(window, fake_slsk):
+    window.settings.setValue("soulseek_username", "Me")
+    window.settings.setValue("soulseek_password", "pw")
+    client = window._get_slsk_client()
+
+    window._shutdown_soulseek()
+
+    assert client.closed

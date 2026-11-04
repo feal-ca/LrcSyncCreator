@@ -18,9 +18,9 @@ from PyQt6.QtWidgets import (
 
 import theme
 from constants import COLOR_DANGER, COLOR_SYNCED, COLOR_UNSYNCED
-from postprocess import DEFAULT_SLSKD_DOWNLOADS, _as_bool
+from postprocess import _as_bool
 from utils import read_artist_title, write_artist_title
-from soulseek import SlskdClient, SoulseekFile
+from soulseek import SoulseekFile
 
 
 def _section(text: str) -> QLabel:
@@ -124,9 +124,9 @@ class TagEditDialog(QDialog):
 
 
 class SettingsDialog(QDialog):
-    """slskd connection, where music goes, and what happens to downloads."""
+    """Where music goes, what happens to downloads, and the Soulseek account."""
 
-    def __init__(self, settings: QSettings, parent=None) -> None:
+    def __init__(self, settings: QSettings, parent=None, soulseek_status: str = "") -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setMinimumWidth(560)
@@ -178,33 +178,31 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.embed_check)
 
         layout.addSpacing(6)
-        layout.addWidget(_section("Soulseek (slskd)"))
+        layout.addWidget(_section("Soulseek"))
         form = QFormLayout()
-        self.slskd_url = QLineEdit(str(settings.value("slskd_url", "http://127.0.0.1:5030")))
-        form.addRow("slskd URL:", self.slskd_url)
-        self.slskd_api_key = QLineEdit(str(settings.value("slskd_api_key", "")))
-        self.slskd_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("API key:", self.slskd_api_key)
-        dl_row = QHBoxLayout()
-        self.slskd_downloads_dir = QLineEdit(
-            str(settings.value("slskd_downloads_dir", "") or DEFAULT_SLSKD_DOWNLOADS)
-        )
-        dl_browse_btn = QPushButton("Browse…")
-        dl_browse_btn.clicked.connect(self._browse_slskd_downloads)
-        dl_row.addWidget(self.slskd_downloads_dir, stretch=1)
-        dl_row.addWidget(dl_browse_btn)
-        form.addRow("slskd's downloads folder:", dl_row)
+        self.soulseek_username = QLineEdit(str(settings.value("soulseek_username", "") or ""))
+        form.addRow("Username:", self.soulseek_username)
+        self.soulseek_password = QLineEdit(str(settings.value("soulseek_password", "") or ""))
+        self.soulseek_password.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow("Password:", self.soulseek_password)
         layout.addLayout(form)
-        test_row = QHBoxLayout()
-        self.test_button = QPushButton("Test connection")
-        self.test_button.clicked.connect(self._test_connection)
-        test_row.addWidget(self.test_button)
-        test_row.addStretch(1)
-        layout.addLayout(test_row)
-        self.test_status = QLabel("Run ./scripts/setup_slskd.sh once. LRC Studio starts slskd by itself after that.")
-        self.test_status.setWordWrap(True)
-        self.test_status.setProperty("role", "faint")
-        layout.addWidget(self.test_status)
+        account_hint = QLabel(
+            "A new username is registered the first time you log in with it. "
+            "Don't use the same account in Nicotine+ at the same time: Soulseek logs the other one out."
+        )
+        account_hint.setWordWrap(True)
+        account_hint.setProperty("role", "faint")
+        layout.addWidget(account_hint)
+        self.share_check = QCheckBox("Share my music folder with other Soulseek users")
+        self.share_check.setToolTip(
+            "Many people only send files to users who share some. Uploads are limited to 2 at a time."
+        )
+        self.share_check.setChecked(_as_bool(settings.value("share_library", True), True))
+        layout.addWidget(self.share_check)
+        self.soulseek_status = QLabel(soulseek_status)
+        self.soulseek_status.setWordWrap(True)
+        self.soulseek_status.setProperty("role", "muted")
+        layout.addWidget(self.soulseek_status)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
@@ -220,24 +218,11 @@ class SettingsDialog(QDialog):
         if chosen:
             self.library_dir.setText(chosen)
 
-    def _browse_slskd_downloads(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(
-            self, "Choose slskd Downloads Folder", self.slskd_downloads_dir.text()
-        )
-        if chosen:
-            self.slskd_downloads_dir.setText(chosen)
-
-    def _test_connection(self) -> None:
-        client = SlskdClient(self.slskd_url.text().strip(), self.slskd_api_key.text().strip())
-        ok, msg = client.check_connection()
-        self.test_status.setText(msg)
-        self.test_status.setStyleSheet(f"color: {(COLOR_SYNCED if ok else COLOR_DANGER).name()};")
-
     def _save(self) -> None:
         s = self._settings
-        s.setValue("slskd_url", self.slskd_url.text().strip())
-        s.setValue("slskd_api_key", self.slskd_api_key.text().strip())
-        s.setValue("slskd_downloads_dir", self.slskd_downloads_dir.text().strip())
+        s.setValue("soulseek_username", self.soulseek_username.text().strip())
+        s.setValue("soulseek_password", self.soulseek_password.text())
+        s.setValue("share_library", self.share_check.isChecked())
         s.setValue("library_dir", self.library_dir.text().strip())
         s.setValue("convert_lossless", self.convert_check.isChecked())
         s.setValue("opus_bitrate", int(self.bitrate_combo.currentData()))

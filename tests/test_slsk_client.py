@@ -10,12 +10,13 @@ import pytest
 pytest.importorskip("aioslsk")
 
 from aioslsk.events import SearchResultEvent
-from aioslsk.protocol.primitives import Attribute, AttributeKey, FileData
+from aioslsk.protocol.primitives import Attribute, AttributeKey, DirectoryData, FileData
 from aioslsk.search.model import SearchRequest, SearchResult
 from aioslsk.transfer.model import FailReason, Transfer, TransferDirection, TransferState
 
 import slsk_client
-from slsk_client import SlskClient, read_slskd_credentials, slskd_state, to_soulseek_files
+from slsk_client import SlskClient, listing_to_files, read_slskd_credentials, slskd_state, to_soulseek_files
+from soulseek import SoulseekFile
 from soulseek import SlskdConnectionError
 
 
@@ -162,3 +163,26 @@ def test_env_vars_named_like_aioslsk_settings_are_ignored(tmp_path, monkeypatch)
 
     assert c.listen_port == 2234
     assert slsk_client  # module imported fine
+
+
+def test_folder_listing_joins_bare_filenames_and_copies_peer_stats():
+    like = SoulseekFile("peer x", "music\\Manu Chao\\Clandestino\\01 - Clandestino.mp3", 10, 320, None, 3, False)
+    listing = [DirectoryData("music\\Manu Chao\\Clandestino", [
+        FileData(1, "01 - Clandestino.mp3", 10, "mp3", [Attribute(AttributeKey.BITRATE, 320)]),
+        FileData(1, "cover.jpg", 1, "jpg", []),
+        FileData(1, "music\\Manu Chao\\Clandestino\\02 - Desaparecido.mp3", 11, "mp3", []),
+    ])]
+
+    files = listing_to_files("peer x", listing, like)
+
+    assert [f.filename for f in files] == [
+        "music\\Manu Chao\\Clandestino\\01 - Clandestino.mp3",
+        "music\\Manu Chao\\Clandestino\\02 - Desaparecido.mp3",
+    ]
+    assert all(f.queue_length == 3 and not f.has_free_slot for f in files)
+    assert files[0].bitrate == 320
+
+
+def test_folder_listing_with_forward_slashes():
+    files = listing_to_files("u", [DirectoryData("a/b", [FileData(1, "song.opus", 3, "opus", [])])], None)
+    assert [f.filename for f in files] == ["a/b/song.opus"]

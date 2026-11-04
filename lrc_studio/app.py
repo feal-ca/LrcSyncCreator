@@ -21,13 +21,14 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
 import vlc
-from PyQt6.QtCore import QFile, Qt, QSettings, QTimer
+from PyQt6.QtCore import QEventLoop, QFile, Qt, QSettings, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QDialog, QFrame, QHBoxLayout,
@@ -56,9 +57,10 @@ import theme
 from dialogs import LyricsPickerDialog, SettingsDialog, ValidateSyncDialog
 from download_view import DownloadView
 from library_panel import LibraryPanel, scan_audio_files
-from postprocess import _as_bool
+from postprocess import _as_bool, downloads_dir_from_settings
 from search_view import SearchView
-from soulseek import SlskdClient
+from slsk_client import SlskClient, read_slskd_credentials
+from soulseek import SlskdError
 from spotify_playlist import is_spotify_link
 from transfers_view import TransfersView
 from widgets import TimelineWidget, Verse
@@ -88,6 +90,11 @@ class _Command:
     help_text: str | None = None      # Help-dialog phrasing; defaults to *label*
     separator_before: bool = False    # start a new group within its menu
 
+
+# An old slskd setup's config: its Soulseek account is carried over once.
+SLSKD_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "slskd-bin", "slskd.yml"
+)
 
 # Pages of the main window's workspace stack (see LrcSyncApp._init_ui).
 WORKSPACE_EDITOR = 0
@@ -146,10 +153,11 @@ class LrcSyncApp(QMainWindow):
         self._lyrics_pending: list[str] = []
         self._qa_thread: LyricsQAThread | None = None
         self._convert_thread: LibraryConvertThread | None = None
-        # slskd process we spawned ourselves (None if the user is running
-        # their own instance, or we haven't tried to start one yet) — only
-        # ever terminated on app exit if we're the one who started it.
-        self._slskd_process: subprocess.Popen | None = None
+        # The Soulseek connection (built on first use from Settings) and
+        # the background thread logging it in, if one is running.
+        self._slsk: SlskClient | None = None
+        self._slsk_thread: threading.Thread | None = None
+        self._slsk_error = ""
 
         # Unsaved-changes tracking — drives the save-before-switch/close prompt.
         self._dirty: bool = False
@@ -333,19 +341,29 @@ class LrcSyncApp(QMainWindow):
         self.tabs.setTabToolTip(TAB_SEARCH, "Search Soulseek, or paste a Spotify link (Ctrl+F)")
         self.tabs.setTabToolTip(TAB_DOWNLOADS, "Downloads in progress and finished (Ctrl+J)")
         self.tabs.currentChanged.connect(self._on_tab_changed)
-        right_layout.addWidget(self.tabs)
+        tabs_row = QHBoxLayout()
+        tabs_row.addWidget(self.tabs)
+        tabs_row.addStretch(1)
+        self.slsk_status_label = QLabel("")
+        self.slsk_status_label.setProperty("role", "faint")
+        tabs_row.addWidget(self.slsk_status_label)
+        right_layout.addLayout(tabs_row)
+        self._slsk_status_timer = QTimer(self)
+        self._slsk_status_timer.setInterval(2000)
+        self._slsk_status_timer.timeout.connect(self._refresh_slsk_status)
+        self._slsk_status_timer.start()
 
         self.workspace = QStackedWidget()
         self.workspace.addWidget(self._build_lyrics_panel())      # WORKSPACE_EDITOR = 0
 
         # The one download engine; the Playlist page feeds it too.
-        self.transfers_view = TransfersView(self.settings, lambda: self._get_slskd_client(), self)
+        self.transfers_view = TransfersView(self.settings, lambda: self._get_slsk_client(), self)
         self.transfers_view.file_ready.connect(self._on_transfer_ready)
         self.transfers_view.active_count_changed.connect(self._on_active_downloads_changed)
         self.transfers_view.open_requested.connect(self._open_in_library)
 
         self.download_view = DownloadView(
-            self.settings, lambda: self._get_slskd_client(), self._collect_library_paths, self,
+            self.settings, lambda: self._get_slsk_client(), self._collect_library_paths, self,
             transfers=self.transfers_view,
         )
         self.download_view.files_ready.connect(self._on_download_files_ready)
@@ -359,7 +377,7 @@ class LrcSyncApp(QMainWindow):
         # Lambdas rather than bound methods so a test (or a later
         # override) replacing these on the instance is honoured.
         self.search_view = SearchView(
-            self.settings, lambda: self._get_slskd_client(), is_spotify_link, self,
+            self.settings, lambda: self._get_slsk_client(), is_spotify_link, self,
         )
         self.search_view.spotify_link_entered.connect(lambda link: self._open_batch_import(link))
         self.search_view.download_requested.connect(self._queue_downloads)
@@ -393,6 +411,9 @@ class LrcSyncApp(QMainWindow):
 
         self.workspace.setCurrentIndex(WORKSPACE_EMPTY)
         QTimer.singleShot(0, self._load_library)
+        # Log in to Soulseek in the background if an account is set, so the
+        # first search doesn't wait for it (like Nicotine+ does at start).
+        QTimer.singleShot(500, self._autoconnect_soulseek)
 
     def _build_empty_state(self) -> QWidget:
         page = QWidget()
@@ -1364,135 +1385,132 @@ class LrcSyncApp(QMainWindow):
         self.status_bar.setText(msg)
 
     # ==================================================================
-    # Soulseek integration (via slskd — see lrc_studio/soulseek.py)
+    # Soulseek (in-process client — see lrc_studio/slsk_client.py)
     # ==================================================================
 
-    def _get_slskd_client(self) -> SlskdClient | None:
-        url = str(self.settings.value("slskd_url", "")).strip()
-        key = str(self.settings.value("slskd_api_key", "")).strip()
-        if not url or not key:
+    def _soulseek_credentials(self) -> tuple[str, str]:
+        """The account from Settings, carried over from slskd.yml once."""
+        user = str(self.settings.value("soulseek_username", "") or "").strip()
+        password = str(self.settings.value("soulseek_password", "") or "")
+        if not (user and password):
+            old = read_slskd_credentials(SLSKD_CONFIG_PATH)
+            if old:
+                user, password = old
+                self.settings.setValue("soulseek_username", user)
+                self.settings.setValue("soulseek_password", password)
+        return user, password
+
+    def _build_slsk_client(self) -> SlskClient | None:
+        user, password = self._soulseek_credentials()
+        if not (user and password):
+            return None
+        library_dir = self.library_panel.library_dir()
+        share = _as_bool(self.settings.value("share_library", True), True)
+        shared = (library_dir,) if share and library_dir and os.path.isdir(library_dir) else ()
+        return SlskClient(user, password, downloads_dir_from_settings(self.settings), shared_dirs=shared)
+
+    def _start_slsk_connect(self) -> None:
+        """Log in on a background thread (never blocks the window)."""
+        if self._slsk is None:
+            self._slsk = self._build_slsk_client()
+            if self._slsk is None:
+                return
+        if self._slsk_thread is not None and self._slsk_thread.is_alive():
+            return
+        client = self._slsk
+
+        def work() -> None:
+            try:
+                client.ensure_connected()
+                self._slsk_error = ""
+            except SlskdError as exc:
+                self._slsk_error = str(exc)
+            except Exception as exc:  # noqa: BLE001 — shown to the user, never fatal
+                self._slsk_error = f"Soulseek failed to start: {exc}"
+
+        self._slsk_thread = threading.Thread(target=work, name="slsk-connect", daemon=True)
+        self._slsk_thread.start()
+
+    def _get_slsk_client(self) -> SlskClient | None:
+        """The logged-in Soulseek client, connecting first if needed (the
+        window stays responsive meanwhile). None, with an explanation,
+        when there's no account or the login failed."""
+        if self._slsk is not None and self._slsk.check_connection()[0]:
+            return self._slsk
+        if self._slsk is None and self._build_slsk_client() is None:
             QMessageBox.information(
-                self,
-                "Soulseek Not Configured",
-                "Set up slskd first:\n\n"
-                "  ./scripts/setup_slskd.sh\n\n"
-                "Then fill in its URL and API key under Tools → Settings — "
-                "LRC Studio will start slskd itself from there on.",
+                self, "Soulseek Account Needed",
+                "Enter your Soulseek username and password in Settings. "
+                "Any new name works: Soulseek registers it the first time you log in.",
             )
+            self._open_settings_dialog()
             return None
-
-        client = SlskdClient(url, key)
-        ok, _ = client.check_connection()
-        if ok:
-            return client
-
-        if not self._ensure_slskd_running():
-            return None
-        if self._wait_for_slskd(client):
-            return client
-
-        # slskd's process was alive the whole wait but never reached a
-        # logged-in state — most often it lost its Soulseek connection
-        # earlier in the session and isn't reconnecting on its own.
-        # Waiting longer doesn't help that; a fresh restart usually does.
-        # Only do this for a process we launched ourselves — never kill
-        # an instance the user is running (and watching) by hand.
-        # Never while downloads are running: restarting slskd aborts every
-        # transfer in flight ("Application shut down").
-        if self._downloads_active():
-            self.status_bar.setText(
-                "slskd isn't logged in to Soulseek right now; it usually reconnects by itself."
-            )
-            return client
-        if self._slskd_process is not None and self._restart_slskd():
-            if self._wait_for_slskd(client):
-                return client
-
+        self._start_slsk_connect()
+        self.status_bar.setText("Connecting to Soulseek…")
+        thread = self._slsk_thread
+        while thread is not None and thread.is_alive():
+            QApplication.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 50)
+            thread.join(0.05)
+        self._refresh_slsk_status()
+        if self._slsk is not None and self._slsk.check_connection()[0]:
+            self.status_bar.setText("Connected to Soulseek.")
+            return self._slsk
+        message = self._slsk_error or (self._slsk.check_connection()[1] if self._slsk else "Not connected.")
         QMessageBox.warning(
-            self,
-            "Soulseek Unavailable",
-            f"slskd didn't come up in time at {url}, even after a restart. "
-            "Run ./scripts/run_slskd.sh yourself to see what's going wrong, "
-            "or check its URL/API key under Tools → Settings.",
+            self, "Soulseek Unavailable",
+            f"{message}\n\nCheck the account in File → Settings, or try again in a moment.",
         )
         return None
+
+    def _refresh_slsk_status(self) -> None:
+        if self._slsk is None:
+            self.slsk_status_label.setText("")
+            return
+        ok, message = self._slsk.check_connection()
+        if ok:
+            text = "Soulseek: online"
+        elif self._slsk_thread is not None and self._slsk_thread.is_alive():
+            text = "Soulseek: connecting…"
+        else:
+            text = "Soulseek: offline"
+        self.slsk_status_label.setText(text)
+        self.slsk_status_label.setToolTip(self._slsk_error or message)
+
+    def _reset_slsk_client(self) -> None:
+        """Account or sharing changed: drop the old session, log in anew."""
+        self._shutdown_soulseek()
+        if self._build_slsk_client() is not None:
+            self._start_slsk_connect()
+
+    def _autoconnect_soulseek(self) -> None:
+        user = str(self.settings.value("soulseek_username", "") or "").strip()
+        if user and self.settings.value("soulseek_password"):
+            self._start_slsk_connect()
+            self._refresh_slsk_status()
+
+    def _shutdown_soulseek(self) -> None:
+        client, self._slsk = self._slsk, None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001 — closing anyway
+                pass
+        self._refresh_slsk_status()
 
     def _downloads_active(self) -> bool:
         return self.transfers_view.active_count() > 0 or self.download_view.is_batch_active()
 
-    def _restart_slskd(self) -> bool:
-        """Kill and relaunch the slskd process we control."""
-        if self._slskd_process is not None and self._slskd_process.poll() is None:
-            self.status_bar.setText("slskd seems stuck — restarting it…")
-            QApplication.processEvents()
-            try:
-                self._slskd_process.terminate()
-                self._slskd_process.wait(timeout=5)
-            except Exception:
-                try:
-                    self._slskd_process.kill()
-                except Exception:
-                    pass
-        self._slskd_process = None
-        return self._ensure_slskd_running()
-
-    def _ensure_slskd_running(self) -> bool:
-        """Launch slskd via ``scripts/run_slskd.sh`` if it isn't already
-        running under us. Returns False (with an explanatory dialog) only
-        when we can't even attempt to start it — e.g. the binary was never
-        installed via ``setup_slskd.sh``.
-        """
-        if self._slskd_process is not None and self._slskd_process.poll() is None:
-            return True  # already starting/running from a previous call
-
-        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        script_path = os.path.join(root_dir, "scripts", "run_slskd.sh")
-        binary_path = os.path.join(root_dir, "slskd-bin", "slskd")
-        if not os.path.isfile(binary_path):
-            QMessageBox.information(
-                self,
-                "Soulseek Not Set Up",
-                "slskd isn't installed yet. Run this once from a terminal:\n\n"
-                "  ./scripts/setup_slskd.sh\n\n"
-                "Then fill in its credentials in slskd-bin/slskd.yml and try again.",
-            )
-            return False
-
-        self.status_bar.setText("Starting slskd…")
-        QApplication.processEvents()
-        log_path = os.path.join(root_dir, "slskd-bin", "slskd-app.log")
-        try:
-            log = open(log_path, "ab")
-            self._slskd_process = subprocess.Popen(
-                [script_path], stdout=log, stderr=subprocess.STDOUT,
-            )
-            log.close()   # the child keeps its own handle
-        except OSError as exc:
-            QMessageBox.warning(
-                self, "Couldn't Start slskd", f"Failed to launch {script_path}: {exc}",
-            )
-            return False
-        return True
-
-    def _wait_for_slskd(self, client: SlskdClient, timeout_s: float = 25.0) -> bool:
-        """Block (while pumping the event loop) until *client* reports a
-        live, logged-in slskd, or *timeout_s* elapses."""
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            if self._slskd_process is not None and self._slskd_process.poll() is not None:
-                return False  # the process we started already exited
-            ok, msg = client.check_connection()
-            if ok:
-                self.status_bar.setText(msg)
-                return True
-            self.status_bar.setText(f"Starting slskd… ({msg})")
-            QApplication.processEvents()
-            time.sleep(0.5)
-            QApplication.processEvents()
-        return False
-
     def _open_settings_dialog(self) -> None:
-        SettingsDialog(self.settings, self).exec()
+        keys = ("soulseek_username", "soulseek_password", "share_library", "library_dir")
+        before = [self.settings.value(k) for k in keys]
+        status = self._slsk.check_connection()[1] if self._slsk is not None else ""
+        dialog = SettingsDialog(self.settings, self, soulseek_status=self._slsk_error or status)
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        dialog.deleteLater()
+        if accepted and [self.settings.value(k) for k in keys] != before:
+            if self._slsk is not None or self._build_slsk_client() is not None:
+                self._reset_slsk_client()
+            self._load_library()
 
     def _find_music(self) -> None:
         self._show_page(WORKSPACE_SEARCH)
@@ -1656,8 +1674,8 @@ class LrcSyncApp(QMainWindow):
         self.search_view.shutdown()
         self.transfers_view.shutdown()
 
-        if self._slskd_process is not None and self._slskd_process.poll() is None:
-            self._slskd_process.terminate()
+        self._slsk_status_timer.stop()
+        self._shutdown_soulseek()
 
         # Release the VLC player/instance explicitly rather than relying
         # on Python GC to eventually free the underlying native

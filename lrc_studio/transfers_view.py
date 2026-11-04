@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
 
 import theme
 from postprocess import downloads_dir_from_settings, finalize_download, options_from_settings
-from soulseek import SlskdClient, SoulseekFile
+from soulseek import SoulseekClient, SoulseekFile
 from workers import TransferThread, stop_thread
 
 MAX_ACTIVE = 6
@@ -101,7 +101,7 @@ class TransfersView(QWidget):
     def __init__(
         self,
         settings: QSettings,
-        get_client: Callable[[], SlskdClient | None],
+        get_client: Callable[[], SoulseekClient | None],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -110,7 +110,7 @@ class TransfersView(QWidget):
         self._items: list[TransferItem] = []
         self._threads: dict[int, TransferThread] = {}
         self._next_id = 1
-        self._client: SlskdClient | None = None
+        self._client: SoulseekClient | None = None
         self._build_ui()
 
     # -- UI -----------------------------------------------------------------
@@ -234,7 +234,7 @@ class TransfersView(QWidget):
             self._client = self._get_client()
             if self._client is None:
                 for item in waiting:
-                    self._set_phase(item, "failed", -1, "slskd isn't available")
+                    self._set_phase(item, "failed", -1, "Not connected to Soulseek")
                 return
 
         downloads_dir = downloads_dir_from_settings(self._settings)
@@ -299,7 +299,7 @@ class TransfersView(QWidget):
         for item in targets:
             if item.phase in ("failed", "cancelled"):
                 self._set_phase(item, "waiting", 0, "Waiting")
-        self._client = None   # re-check slskd on retry
+        self._client = None   # reconnect on retry
         self._pump()
         self._refresh_summary()
 

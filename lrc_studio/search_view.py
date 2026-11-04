@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
 )
 
 import theme
-from soulseek import ResultFilter, SlskdClient, SoulseekFile
+from soulseek import ResultFilter, SoulseekClient, SoulseekFile
 from workers import FolderBrowseThread, SoulseekLiveSearchThread
 
 HISTORY_KEY = "search_history"
@@ -332,7 +332,7 @@ class SearchView(QWidget):
     def __init__(
         self,
         settings: QSettings,
-        get_client: Callable[[], SlskdClient | None],
+        get_client: Callable[[], SoulseekClient | None],
         is_spotify_link: Callable[[str], bool],
         parent: QWidget | None = None,
     ) -> None:

@@ -32,7 +32,7 @@ from constants import (
     COLOR_UNSYNCED,
 )
 from dialogs import SoulseekSearchDialog
-from soulseek import SlskdClient, SoulseekFile, clean_query_text
+from soulseek import SoulseekClient, SoulseekFile, clean_query_text
 from workers import (
     PlaylistFetchThread, PlaylistSearchThread, SoulseekSearchThread, stop_thread,
 )
@@ -107,7 +107,7 @@ class DownloadView(QWidget):
     def __init__(
         self,
         settings: QSettings,
-        get_client: Callable[[], SlskdClient | None],
+        get_client: Callable[[], SoulseekClient | None],
         collect_library_paths: Callable[[], list[str]],
         parent: QWidget | None = None,
         transfers=None,
@@ -276,7 +276,7 @@ class DownloadView(QWidget):
         self.fetch_button.setEnabled(True)
         self.status_label.setText(f"Couldn't fetch from Spotify: {message}")
 
-    def _on_fetched(self, client: SlskdClient, tracks: list, missing: list, truncated: bool) -> None:
+    def _on_fetched(self, client: SoulseekClient, tracks: list, missing: list, truncated: bool) -> None:
         self.fetch_button.setEnabled(True)
         missing_set = set(missing)
 
@@ -315,7 +315,7 @@ class DownloadView(QWidget):
     # Search phase (auto-match, no download yet)
     # ------------------------------------------------------------------
 
-    def _start_search(self, client: SlskdClient, rows: list[tuple[int, object]]) -> None:
+    def _start_search(self, client: SoulseekClient, rows: list[tuple[int, object]]) -> None:
         if self._search_thread is not None and self._search_thread.isRunning():
             QMessageBox.information(
                 self, "Search In Progress",

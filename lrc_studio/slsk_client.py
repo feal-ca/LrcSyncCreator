@@ -110,6 +110,29 @@ def to_soulseek_files(result) -> list[SoulseekFile]:
     return out
 
 
+def listing_to_files(username: str, directories, like: SoulseekFile | None) -> list[SoulseekFile]:
+    """A peer's folder listing (aioslsk DirectoryData) as SoulseekFiles.
+    Names inside may be bare basenames relative to the folder; peer stats
+    (queue, free slot, speed) are copied from *like*, the search result the
+    folder was reached from, since a listing doesn't carry them."""
+    results = []
+    for d in directories:
+        sep = "\\" if "\\" in d.name or "/" not in d.name else "/"
+        for f in d.files:
+            name = f.filename if ("\\" in f.filename or "/" in f.filename) else f"{d.name}{sep}{f.filename}"
+            if not name.lower().endswith(AUDIO_EXTENSIONS):
+                continue
+            attrs = f.get_attribute_map()
+            results.append(SoulseekFile(
+                username=username, filename=name, size=f.filesize,
+                bitrate=attrs.get(AttributeKey.BITRATE) or None,
+                length_s=attrs.get(AttributeKey.DURATION) or None,
+                queue_length=like.queue_length if like else 0,
+                has_free_slot=like.has_free_slot if like else False,
+                upload_speed=like.upload_speed if like else None))
+    return sorted(results, key=lambda r: r.filename.lower())
+
+
 def read_slskd_credentials(path: str) -> tuple[str, str] | None:
     """The Soulseek username/password from an old slskd.yml (to carry them
     over once), or None. Only the top-level ``soulseek:`` block counts; the
@@ -373,7 +396,7 @@ class SlskClient:
 
     def search(self, query, wait_s=20.0, poll_interval_s=0.5, on_progress=None, stop_event=None,
                search_timeout_ms=None, settle_s: float | None = None) -> list[SoulseekFile]:
-        """SlskdClient-compatible blocking search. settle_s (new): return early
+        """Blocking search (the Spotify matcher and Change match use it). settle_s: return early
         once results have arrived and none came in for that long."""
         if search_timeout_ms:
             wait_s = min(wait_s, search_timeout_ms / 1000)
@@ -404,22 +427,7 @@ class SlskClient:
                                                 response=True, timeout=timeout_s)
             except (TimeoutError, NetworkError) as exc:
                 raise SlskdError(f"{username} didn't answer the folder request.") from exc
-        results = []
-        for d in self._run(go(), timeout_s + 5) or []:
-            sep = "\\" if "\\" in d.name or "/" not in d.name else "/"
-            for f in d.files:
-                name = f.filename if ("\\" in f.filename or "/" in f.filename) else f"{d.name}{sep}{f.filename}"
-                if not name.lower().endswith(AUDIO_EXTENSIONS):
-                    continue
-                attrs = f.get_attribute_map()
-                results.append(SoulseekFile(
-                    username=username, filename=name, size=f.filesize,
-                    bitrate=attrs.get(AttributeKey.BITRATE) or None,
-                    length_s=attrs.get(AttributeKey.DURATION) or None,
-                    queue_length=like.queue_length if like else 0,
-                    has_free_slot=like.has_free_slot if like else False,
-                    upload_speed=like.upload_speed if like else None))
-        return sorted(results, key=lambda r: r.filename.lower())
+        return listing_to_files(username, self._run(go(), timeout_s + 5) or [], like)
 
     # -- transfers -------------------------------------------------------------
     def download(self, file: SoulseekFile) -> None:

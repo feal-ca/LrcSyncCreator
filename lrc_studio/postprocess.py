@@ -150,9 +150,11 @@ def finalize_download(local_path: str, options: FinalizeOptions) -> str:
     return dest
 
 
-DEFAULT_SLSKD_DOWNLOADS = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "slskd-bin", "downloads")
-)
+def default_downloads_dir() -> str:
+    """Where Soulseek downloads land before they're finalized: the app's
+    data folder, deliberately outside the (synced) library."""
+    data_home = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(data_home, "LrcStudio", "downloads")
 
 
 def _as_bool(value, default: bool) -> bool:
@@ -181,4 +183,4 @@ def options_from_settings(settings) -> FinalizeOptions:
 
 
 def downloads_dir_from_settings(settings) -> str:
-    return str(settings.value("slskd_downloads_dir", "") or "").strip() or DEFAULT_SLSKD_DOWNLOADS
+    return str(settings.value("downloads_dir", "") or "").strip() or default_downloads_dir()
